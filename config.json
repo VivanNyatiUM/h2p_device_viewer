@@ -1,0 +1,13 @@
+{
+  "gds_path": "semiconductor_design.gds",
+  "gds_layer": 0,
+  "gds_datatype": 0,
+  "tile_cols": 40,
+  "tile_rows": 58,
+  "tile_width": 3000,
+  "tile_height": 1992,
+  "overlap_x_percent": 10.0,
+  "overlap_y_percent": 10.0,
+  "output_image_size": 4000,
+  "downscale_factor": 0.05
+}

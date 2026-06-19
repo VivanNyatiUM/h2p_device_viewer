@@ -1,0 +1,10 @@
+repo/
+├── tree.txt
+├── config.json
+├── wafer_alignment_and_extraction.py
+├── semiconductor_design.gds
+├── batch_wafers.txt
+└── folder_of_tiles/
+    ├── tile_x001_y001.png
+    ├── tile_x001_y002.png
+    └── ...
