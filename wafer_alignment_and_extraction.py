@@ -1084,7 +1084,8 @@ class DeviceDefectMapperTool:
         self.gds_R = gds_R
         self.config = config
         
-        self.max_disp_w = MAX_DISPLAY_WIDTH
+        # Self-scaled display window width leaves horizontal room for 320px sidebar
+        self.max_disp_w = 950
         self.max_disp_h = MAX_DISPLAY_HEIGHT
         
         self.output_json_path = f"{wafer_id}_device_defects.json"
@@ -1105,6 +1106,15 @@ class DeviceDefectMapperTool:
             raise FileNotFoundError(f"No cell crops discovered in '{self.out_dir}'. Ensure step 1 extraction succeeded first.")
 
         self.cell_files.sort(key=lambda x: (x["cell_data"]["row"], x["cell_data"]["col"]))
+
+        # Cache absolute GDS bounds across all devices to normalize wafer map coords
+        self.all_min_x = min(c["cell_data"]["bbox"][0] for c in self.cell_files)
+        self.all_min_y = min(c["cell_data"]["bbox"][1] for c in self.cell_files)
+        self.all_max_x = max(c["cell_data"]["bbox"][2] for c in self.cell_files)
+        self.all_max_y = max(c["cell_data"]["bbox"][3] for c in self.cell_files)
+        self.gds_w = self.all_max_x - self.all_min_x
+        self.gds_h = self.all_max_y - self.all_min_y
+        self.cell_map_bounds = []
 
         self.native_dims = {}
         for entry in self.cell_files:
@@ -1209,24 +1219,127 @@ class DeviceDefectMapperTool:
         self.redraw_canvas()
 
     def redraw_canvas(self):
-        self.canvas = self.img_disp.copy()
+        panel_width = 320
+        self.canvas = np.zeros((self.display_height, self.display_width + panel_width, 3), dtype=np.uint8)
+        self.canvas[:, :self.display_width] = self.img_disp
+
+        # Fill background of control panel
+        self.canvas[:, self.display_width:] = 40
+
         cell_entry = self.cell_files[self.current_idx]
         filename = cell_entry["filename"]
 
-        hud_lines = [
-            f"DEVICE [{self.current_idx + 1}/{len(self.cell_files)}]: {filename}",
-            "  - Drag mouse to draw bounding boxes around defects.",
-            "  - Class Selection: [1: blister] [2: tear] [3: delamination] [4: particulate] [5: hole]",
-            "  - Controls: [Right/Space: Next] [Left: Prev] [X: Toggle Exclusion] [C: Clear] [Q/Esc: Save & Close]"
+        # Draw Title & Navigation State inside side panel
+        title_y = 35
+        cv2.putText(self.canvas, "DEVICE METRIC STATUS", (self.display_width + 15, title_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(self.canvas, f"Index: {self.current_idx + 1} / {len(self.cell_files)}", (self.display_width + 15, title_y + 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(self.canvas, f"File: {filename}", (self.display_width + 15, title_y + 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # Draw Legend block inside side panel
+        legend_y = 120
+        cv2.putText(self.canvas, "LEGEND GUIDE:", (self.display_width + 15, legend_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        
+        legend_items = [
+            ("Current Selected", (0, 165, 255)),
+            ("Annotated / Active", (0, 120, 0)),
+            ("Excluded / Damaged", (0, 0, 150)),
+            ("Unvisited / Pending", (80, 80, 80))
         ]
+        for idx_l, (label_txt, l_color) in enumerate(legend_items):
+            ly = legend_y + 20 + idx_l * 20
+            cv2.rectangle(self.canvas, (self.display_width + 15, ly - 10), (self.display_width + 27, ly + 2), l_color, -1)
+            cv2.rectangle(self.canvas, (self.display_width + 15, ly - 10), (self.display_width + 27, ly + 2), (255, 255, 255), 1)
+            cv2.putText(self.canvas, label_txt, (self.display_width + 37, ly), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
 
-        for i, line in enumerate(hud_lines):
-            cv2.putText(self.canvas, line, (15, 25 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
-            cv2.putText(self.canvas, line, (15, 25 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        # Keyboard shortcuts mapping list
+        shortcuts_y = legend_y + 115
+        cv2.putText(self.canvas, "SHORTCUTS:", (self.display_width + 15, shortcuts_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        
+        shortcuts = [
+            "Press [1-5] to assign class",
+            "[X]: Toggle Exclusion",
+            "[C]: Clear current anomalies",
+            "[Right/Space]: Next Cell",
+            "[Left]: Previous Cell",
+            "[Esc/Q]: Save & Compile Stitch"
+        ]
+        for idx_s, shortcut_text in enumerate(shortcuts):
+            sy = shortcuts_y + 18 + idx_s * 15
+            cv2.putText(self.canvas, shortcut_text, (self.display_width + 15, sy), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1, cv2.LINE_AA)
 
+        # --- WAFER MAP RENDER BLOCK ---
+        map_size = 260
+        map_padding = 15
+        map_draw_size = map_size - 2 * map_padding
+        
+        map_x_start = self.display_width + 30
+        map_y_start = self.display_height - map_size - 15
+        if map_y_start < 250:
+            map_y_start = max(250, self.display_height - map_size - 5)
+
+        # Container outline for the wafer map
+        cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), 
+                      (map_x_start + map_size - 10, map_y_start + map_size - 10), (30, 30, 30), -1)
+        cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), 
+                      (map_x_start + map_size - 10, map_y_start + map_size - 10), (100, 100, 100), 1)
+        
+        cv2.putText(self.canvas, "WAFER MAP (CLICK TO SWITCH)", (map_x_start - 10, map_y_start - 18), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+
+        self.cell_map_bounds = []
+        for idx, entry in enumerate(self.cell_files):
+            cell_data = entry["cell_data"]
+            cell_filename = entry["filename"]
+            min_x, min_y, max_x, max_y = cell_data["bbox"]
+            
+            # Map coordinates normalized [0, 1] relative to design bounds
+            norm_x1 = (min_x - self.all_min_x) / (self.gds_w + 1e-9)
+            norm_y1 = (min_y - self.all_min_y) / (self.gds_h + 1e-9)
+            norm_x2 = (max_x - self.all_min_x) / (self.gds_w + 1e-9)
+            norm_y2 = (max_y - self.all_min_y) / (self.gds_h + 1e-9)
+            
+            local_x1 = int(map_x_start + norm_x1 * map_draw_size)
+            local_y2 = int(map_y_start + (1.0 - norm_y1) * map_draw_size)
+            local_x2 = int(map_x_start + norm_x2 * map_draw_size)
+            local_y1 = int(map_y_start + (1.0 - norm_y2) * map_draw_size)
+            
+            mx1, mx2 = min(local_x1, local_x2), max(local_x1, local_x2)
+            my1, my2 = min(local_y1, local_y2), max(local_y1, local_y2)
+            
+            self.cell_map_bounds.append((mx1, my1, mx2, my2))
+            
+            is_current = (idx == self.current_idx)
+            is_excluded = (cell_filename in self.exclusions)
+            has_ann = (len(self.annotations.get(cell_filename, [])) > 0)
+            
+            if is_current:
+                color = (0, 165, 255)
+                thickness = -1
+            elif is_excluded:
+                color = (0, 0, 150)
+                thickness = -1
+            elif has_ann:
+                color = (0, 120, 0)
+                thickness = -1
+            else:
+                color = (80, 80, 80)
+                thickness = 1
+                
+            cv2.rectangle(self.canvas, (mx1, my1), (mx2, my2), color, thickness)
+            if thickness == -1:
+                cv2.rectangle(self.canvas, (mx1, my1), (mx2, my2), (200, 200, 200) if is_current else (40, 40, 40), 1)
+
+        # Draw exclusion status text at standard bottom corner inside screen space
         if filename in self.exclusions:
             cv2.rectangle(self.canvas, (0, 0), (self.display_width, self.display_height), (0, 0, 255), 4)
-            cv2.putText(self.canvas, "MARKED FOR EXCLUSION (Press 'X' to Toggle)", (15, self.display_height - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(self.canvas, "MARKED FOR EXCLUSION", (15, self.display_height - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
 
         image_boxes = self.annotations.get(filename, [])
         for box in image_boxes:
@@ -1250,87 +1363,136 @@ class DeviceDefectMapperTool:
         if self.is_waiting_for_key: return
 
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.start_pt, self.current_pt = (x, y), (x, y)
+            if x >= self.display_width:
+                # User clicked inside wafer map sidebar panel
+                for idx, bounds in enumerate(self.cell_map_bounds):
+                    bx1, by1, bx2, by2 = bounds
+                    if bx1 <= x <= bx2 and by1 <= y <= by2:
+                        self.save_annotations_to_file()
+                        self.load_cell_at_index(idx)
+                        return
+                return
+            else:
+                self.drawing = True
+                self.start_pt, self.current_pt = (x, y), (x, y)
 
         elif event == cv2.EVENT_MOUSEMOVE:
             if self.drawing:
-                self.current_pt = (x, y)
+                # Clamp coordinates inside the bounds of the active cell crop space
+                clamped_x = max(0, min(x, self.display_width - 1))
+                clamped_y = max(0, min(y, self.display_height - 1))
+                self.current_pt = (clamped_x, clamped_y)
+                
                 temp_frame = self.canvas.copy()
                 cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 255, 255), 1)
                 cv2.imshow("Device Defect Register", temp_frame)
 
         elif event == cv2.EVENT_LBUTTONUP:
-            self.drawing = False
-            self.current_pt = (x, y)
-            w_disp = abs(self.current_pt[0] - self.start_pt[0])
-            h_disp = abs(self.current_pt[1] - self.start_pt[1])
-            if w_disp < 4 or h_disp < 4:
+            if self.drawing:
+                self.drawing = False
+                clamped_x = max(0, min(x, self.display_width - 1))
+                clamped_y = max(0, min(y, self.display_height - 1))
+                self.current_pt = (clamped_x, clamped_y)
+                
+                w_disp = abs(self.current_pt[0] - self.start_pt[0])
+                h_disp = abs(self.current_pt[1] - self.start_pt[1])
+                if w_disp < 4 or h_disp < 4:
+                    self.redraw_canvas()
+                    return
+
+                temp_frame = self.canvas.copy()
+                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 165, 255), 2)
+                cv2.putText(temp_frame, "CHOOSE CLASS [1-5] (or Esc to cancel)", 
+                            (min(self.start_pt[0], self.current_pt[0]), min(self.start_pt[1], self.current_pt[1]) - 8), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
+                
+                # Render the prominent modal block warning inside the sidebar panel
+                # First, paint a solid dark-gray rectangle over the Y=100 to Y=340 interval to clear previous text
+                cv2.rectangle(temp_frame, (self.display_width + 5, 100), (self.display_width + 315, 340), (40, 40, 40), -1)
+                
+                box_y1 = 105
+                box_y2 = 335
+                cv2.rectangle(temp_frame, (self.display_width + 5, box_y1), (self.display_width + 315, box_y2), (0, 0, 180), -1) # Dark red fill
+                cv2.rectangle(temp_frame, (self.display_width + 5, box_y1), (self.display_width + 315, box_y2), (0, 255, 255), 2)  # Yellow border
+                
+                cv2.putText(temp_frame, "CHOOSE DEFECT TYPE!", (self.display_width + 15, box_y1 + 25), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+                
+                classes_info = [
+                    "[1]: blister",
+                    "[2]: tear",
+                    "[3]: delamination",
+                    "[4]: particulate",
+                    "[5]: hole"
+                ]
+                for idx_cl, c_info in enumerate(classes_info):
+                    cy = box_y1 + 55 + idx_cl * 22
+                    class_name = ["blister", "tear", "delamination", "particulate", "hole"][idx_cl]
+                    cv2.rectangle(temp_frame, (self.display_width + 200, cy - 10), (self.display_width + 215, cy + 2), CLASS_COLORS[class_name], -1)
+                    cv2.rectangle(temp_frame, (self.display_width + 200, cy - 10), (self.display_width + 215, cy + 2), (255, 255, 255), 1)
+                    cv2.putText(temp_frame, c_info, (self.display_width + 20, cy), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                                
+                cv2.putText(temp_frame, "Press [Esc] to cancel box", (self.display_width + 20, box_y1 + 185), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 255), 1, cv2.LINE_AA)
+
+                cv2.imshow("Device Defect Register", temp_frame)
+
+                assigned_class = None
+                self.is_waiting_for_key = True
+                while True:
+                    key_press = cv2.waitKeyEx(0) & 0xFF
+                    if key_press in KEY_MAPPING:
+                        assigned_class = KEY_MAPPING[key_press]
+                        break
+                    elif key_press == 27: 
+                        break
+                self.is_waiting_for_key = False
+
+                if assigned_class is not None:
+                    scale_up_x = self.native_w / float(self.display_width)
+                    scale_up_y = self.native_h / float(self.display_height)
+
+                    orig_x1 = int(round(min(self.start_pt[0], self.current_pt[0]) * scale_up_x))
+                    orig_y1 = int(round(min(self.start_pt[1], self.current_pt[1]) * scale_up_y))
+                    orig_x2 = int(round(max(self.start_pt[0], self.current_pt[0]) * scale_up_x))
+                    orig_y2 = int(round(max(self.start_pt[1], self.current_pt[1]) * scale_up_y))
+
+                    orig_x1 = max(0, min(orig_x1, self.native_w))
+                    orig_y1 = max(0, min(orig_y1, self.native_h))
+                    orig_x2 = max(0, min(orig_x2, self.native_w))
+                    orig_y2 = max(0, min(orig_y2, self.native_h))
+
+                    filename = self.cell_files[self.current_idx]["filename"]
+                    cell_data = self.cell_files[self.current_idx]["cell_data"]
+                    
+                    box_w_px = orig_x2 - orig_x1
+                    box_h_px = orig_y2 - orig_y1
+                    
+                    center_x_px = orig_x1 + (box_w_px / 2.0)
+                    center_y_px = orig_y1 + (box_h_px / 2.0)
+
+                    min_x, min_y, max_x, max_y = cell_data["bbox"]
+                    
+                    gds_w = max_x - min_x
+                    gds_h = max_y - min_y
+                    
+                    center_x_um = min_x + (center_x_px / float(self.native_w)) * gds_w
+                    center_y_um = max_y - (center_y_px / float(self.native_h)) * gds_h
+
+                    width_um = (box_w_px / float(self.native_w)) * gds_w
+                    height_um = (box_h_px / float(self.native_h)) * gds_h
+
+                    self.annotations[filename].append({
+                        "type": assigned_class,
+                        "box_px": [orig_x1, orig_y1, box_w_px, box_h_px],
+                        "center_x_um": round(center_x_um, 3),
+                        "center_y_um": round(center_y_um, 3),
+                        "width_um": round(width_um, 3),
+                        "height_um": round(height_um, 3)
+                    })
+                    self.save_annotations_to_file()
                 self.redraw_canvas()
-                return
-
-            temp_frame = self.canvas.copy()
-            cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 165, 255), 2)
-            cv2.putText(temp_frame, "CHOOSE CLASS [1-5] (or Esc to cancel)", 
-                        (min(self.start_pt[0], self.current_pt[0]), min(self.start_pt[1], self.current_pt[1]) - 8), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
-            cv2.imshow("Device Defect Register", temp_frame)
-
-            assigned_class = None
-            self.is_waiting_for_key = True
-            while True:
-                key_press = cv2.waitKeyEx(0) & 0xFF
-                if key_press in KEY_MAPPING:
-                    assigned_class = KEY_MAPPING[key_press]
-                    break
-                elif key_press == 27: 
-                    break
-            self.is_waiting_for_key = False
-
-            if assigned_class is not None:
-                scale_up_x = self.native_w / float(self.display_width)
-                scale_up_y = self.native_h / float(self.display_height)
-
-                orig_x1 = int(round(min(self.start_pt[0], self.current_pt[0]) * scale_up_x))
-                orig_y1 = int(round(min(self.start_pt[1], self.current_pt[1]) * scale_up_y))
-                orig_x2 = int(round(max(self.start_pt[0], self.current_pt[0]) * scale_up_x))
-                orig_y2 = int(round(max(self.start_pt[1], self.current_pt[1]) * scale_up_y))
-
-                orig_x1 = max(0, min(orig_x1, self.native_w))
-                orig_y1 = max(0, min(orig_y1, self.native_h))
-                orig_x2 = max(0, min(orig_x2, self.native_w))
-                orig_y2 = max(0, min(orig_y2, self.native_h))
-
-                filename = self.cell_files[self.current_idx]["filename"]
-                cell_data = self.cell_files[self.current_idx]["cell_data"]
-                
-                box_w_px = orig_x2 - orig_x1
-                box_h_px = orig_y2 - orig_y1
-                
-                center_x_px = orig_x1 + (box_w_px / 2.0)
-                center_y_px = orig_y1 + (box_h_px / 2.0)
-
-                min_x, min_y, max_x, max_y = cell_data["bbox"]
-                
-                gds_w = max_x - min_x
-                gds_h = max_y - min_y
-                
-                center_x_um = min_x + (center_x_px / float(self.native_w)) * gds_w
-                center_y_um = max_y - (center_y_px / float(self.native_h)) * gds_h
-
-                width_um = (box_w_px / float(self.native_w)) * gds_w
-                height_um = (box_h_px / float(self.native_h)) * gds_h
-
-                self.annotations[filename].append({
-                    "type": assigned_class,
-                    "box_px": [orig_x1, orig_y1, box_w_px, box_h_px],
-                    "center_x_um": round(center_x_um, 3),
-                    "center_y_um": round(center_y_um, 3),
-                    "width_um": round(width_um, 3),
-                    "height_um": round(height_um, 3)
-                })
-                self.save_annotations_to_file()
-            self.redraw_canvas()
 
     def stitch_and_save_wafer_layout(self):
         """Builds a global composite overview stitch with labeling metadata overlaid."""
