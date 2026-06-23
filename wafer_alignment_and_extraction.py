@@ -3,9 +3,7 @@
 wafer_alignment_and_extraction.py
 =================================
 A completely unified, standalone wafer metrology, GDS cell extraction, 
-and interactive defect-labeling tool. This script integrates the functionality 
-of all former modules (io_handler, alignment, gds_parser, manual_align_gui, 
-stitcher, transformer) into a single execution workflow.
+and interactive defect-labeling tool. 
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ from tkinter import ttk
 
 
 # ===========================================================================
-# 1. IO HANDLER CORE FUNCTIONS (formerly io_handler.py)
+# 1. IO HANDLER CORE FUNCTIONS
 # ===========================================================================
 
 def load_config(config_path="config.json"):
@@ -107,7 +105,7 @@ def save_exclusions(exclusions_set, exclusions_path):
 
 
 # ===========================================================================
-# 2. CORE CIRCLE GEOMETRY & METROLOGY (formerly alignment.py)
+# 2. CORE CIRCLE GEOMETRY & METROLOGY
 # ===========================================================================
 
 def get_aligned_tile(src_img, alpha, scale_factor=1.0):
@@ -241,7 +239,7 @@ def robust_vertical_profile_flat(gray_img, xc_ds, yc_ds, R_ds, h_img, w_img, is_
             grad = gradients[i]
 
             if not is_inverted:
-                if grad < -5.0 and intensity > 90 and (15 <= next_intensity <= 75):
+                if Math_grad := grad < -5.0 and intensity > 90 and (15 <= next_intensity <= 75):
                     y_edge = y_start_scan + i + 1
                     profile_pts.append([x, y_edge])
                     break
@@ -467,7 +465,7 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
 
 
 # ===========================================================================
-# 3. GDS PARSING HELPER MODULES (formerly gds_parser.py)
+# 3. GDS PARSING HELPER MODULES
 # ===========================================================================
 
 def parse_gds_wafer_boundary(path, layer=0, datatype=0):
@@ -516,8 +514,66 @@ def get_layer0_polygons(path):
     return polygons
 
 
+def parse_alignment_markers(gds_path: str) -> dict[str, list[dict]]:
+    """
+    Parses Layer 4 alignment markers to find Left and Right groups.
+    An orientation-agnostic check identifies circles and both horizontal/vertical bars.
+    """
+    try:
+        lib = gdstk.read_gds(gds_path)
+    except Exception as e:
+        print(f"Warning: Could not read GDS for alignment markers: {e}")
+        return {"left": [], "right": []}
+
+    top_cells = lib.top_level()
+    if not top_cells:
+        return {"left": [], "right": []}
+    cell = top_cells[0]
+
+    left_markers = []
+    right_markers = []
+
+    # Flatten cell references to ensure we extract absolute global coordinate geometries
+    cell.flatten()
+
+    for poly in cell.polygons:
+        if poly.layer == 4:
+            pts = poly.points
+            min_pt = np.min(pts, axis=0)
+            max_pt = np.max(pts, axis=0)
+            w = max_pt[0] - min_pt[0]
+            h = max_pt[1] - min_pt[1]
+            cx = (min_pt[0] + max_pt[0]) / 2.0
+            cy = (min_pt[1] + max_pt[1]) / 2.0
+
+            # Orientation-agnostic calculations
+            dim_max = max(w, h)
+            dim_min = min(w, h)
+
+            is_circle = (280.0 <= w <= 350.0) and (280.0 <= h <= 350.0)
+            is_bar = (dim_max > 1500.0) and (80.0 <= dim_min <= 600.0)
+
+            if is_circle or is_bar:
+                marker_info = {
+                    "type": "circle" if is_circle else "bar",
+                    "bbox": (float(min_x), float(min_y), float(max_x), float(max_y)) if 'min_x' in locals() else (float(min_pt[0]), float(min_pt[1]), float(max_pt[0]), float(max_pt[1])),
+                    "center": (float(cx), float(cy)),
+                    "polygon": pts.tolist()
+                }
+                
+                # Correcting the Left/Right Flip:
+                # GDS X > 0 corresponds to the Left viewport due to mirror mapping (canvas_x = -g_x)
+                if cx > 0:
+                    left_markers.append(marker_info)
+                else:
+                    right_markers.append(marker_info)
+
+    print(f"  [GDS Marker Parser] Found {len(left_markers)} Left markers and {len(right_markers)} Right markers on Layer 4.")
+    return {"left": left_markers, "right": right_markers}
+
+
 # ===========================================================================
-# 4. DOWNSCALED STITCHING OPERATIONS (formerly stitcher.py)
+# 4. DOWNSCALED STITCHING OPERATIONS
 # ===========================================================================
 
 def generate_downscaled_stitch(folder, config):
@@ -582,7 +638,7 @@ def generate_downscaled_stitch(folder, config):
 
 
 # ===========================================================================
-# 5. COORDINATE TRANSFORMATION PIPELINE (formerly transformer.py)
+# 5. COORDINATE TRANSFORMATION PIPELINE
 # ===========================================================================
 
 class WaferTransformer:
@@ -715,11 +771,11 @@ class WaferTransformer:
 
 
 # ===========================================================================
-# 6. MANUAL OVERLAY ALIGNMENT TOOL (formerly manual_align_gui.py)
+# 6. MANUAL OVERLAY ALIGNMENT TOOL
 # ===========================================================================
 
 class ManualAlignApp:
-    def __init__(self, root, ds_image, xc_ds, yc_ds, R_ds, ds_factor, gds_polygons, gds_R, initial_angle_rad, map_mode=False, gds_center=(0.0, 0.0), shear=0.0):
+    def __init__(self, root, ds_image, xc_ds, yc_ds, R_ds, ds_factor, gds_polygons, gds_R, initial_angle_rad, map_mode=False, gds_center=(0.0, 0.0), shear=0.0, markers=None):
         self.root = root
         self.ds_image = ds_image
         self.xc_ds = xc_ds
@@ -732,6 +788,7 @@ class ManualAlignApp:
         self.xg_c = float(gds_center[0])
         self.yg_c = float(gds_center[1])
         self.shear = float(shear)
+        self.markers = markers if markers is not None else {"left": [], "right": []}
 
         self.initial_angle_rad = initial_angle_rad
         self.initial_angle_deg = initial_angle_rad * 180.0 / np.pi
@@ -742,7 +799,8 @@ class ManualAlignApp:
         self.offset_y = 0.0
         self.scale_mult = 1.0
 
-        self.V_w = 1000
+        # Narrowed workspace canvas (800 width instead of 1000) to trim empty margins
+        self.V_w = 800
         self.V_h = 600
 
         self.zoom = 1.0
@@ -760,20 +818,39 @@ class ManualAlignApp:
 
     def setup_ui(self):
         self.root.title("Interactive GDS Alignment Calibration Workspace")
-        self.root.geometry("1400x700")
+        self.root.geometry("1420x680")  # Standardized geometry width
         self.root.resizable(False, False)
 
         style = ttk.Style()
         style.theme_use("clam")
 
-        self.sidebar = ttk.Frame(self.root, padding=15, width=360)
+        # Sidebar Controls (Column 0)
+        self.sidebar = ttk.Frame(self.root, padding=15, width=340)
         self.sidebar.grid(row=0, column=0, sticky="ns", padx=5, pady=5)
         self.sidebar.grid_propagate(False)
 
+        # Main Workspace Canvas (Column 1 - Width 800)
         self.canvas = tk.Canvas(self.root, width=self.V_w, height=self.V_h, bg="#1e1e1e", highlightthickness=0)
-        self.canvas.grid(row=0, column=1, padx=10, pady=10)
+        self.canvas.grid(row=0, column=1, padx=5, pady=10)
 
-        # UI Controls
+        # Integrated Marker Alignment Assistant (Column 2)
+        self.marker_panel = ttk.Frame(self.root, padding=10, width=250)
+        self.marker_panel.grid(row=0, column=2, sticky="ns", padx=5, pady=5)
+        self.marker_panel.grid_propagate(False)
+
+        ttk.Label(self.marker_panel, text="Marker Alignment Assistant", font=("Helvetica", 11, "bold")).pack(anchor="n", pady=(0, 10))
+
+        # Left Marker Display Box
+        ttk.Label(self.marker_panel, text="Left Marker (GDS Layer 4)", font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(5, 2))
+        self.left_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#151515", highlightthickness=1, highlightbackground="#444")
+        self.left_zoom_canvas.pack(anchor="w", pady=(0, 15))
+
+        # Right Marker Display Box
+        ttk.Label(self.marker_panel, text="Right Marker (GDS Layer 4)", font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(5, 2))
+        self.right_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#151515", highlightthickness=1, highlightbackground="#444")
+        self.right_zoom_canvas.pack(anchor="w", pady=(0, 15))
+
+        # UI Controls in Sidebar
         ttk.Label(self.sidebar, text="1. Rotation (Degrees)", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 2))
         rot_frame = ttk.Frame(self.sidebar)
         rot_frame.pack(fill="x", pady=(0, 10))
@@ -948,52 +1025,195 @@ class ManualAlignApp:
         self.pan_y = 0.0
         self.render()
 
-    def render(self):
+    def get_zoomed_marker_image(self, center_gds: tuple[float, float], marker_polys: list[np.ndarray], size: int = 220) -> np.ndarray:
+        """
+        Creates a cropped image of the physical canvas aligned with the specified GDS coordinate markers,
+        scaling the crop dynamically to fit a constant physical span.
+        The GDS overlay markers inside the zoom panel remain completely static (unaligned, unrotated, and untranslated),
+        while the underlying camera background rotates, scales, and translates to represent dynamic adjustments.
+        """
+        gx, gy = center_gds
+        S_base = self.Rg / self.R_ds
+
+        # 1. Compute the dynamic warp transformation of the wafer image
+        # This applies scaling, rotation, and translations purely to the wafer image
+        M_rs = cv2.getRotationMatrix2D((self.xc_ds, self.yc_ds), self.current_angle_deg, self.scale_mult)
+        dx_can = -self.offset_x / S_base
+        dy_can = self.offset_y / S_base
+        M_rs[0, 2] += dx_can
+        M_rs[1, 2] += dy_can
+
+        # Generate a fully aligned temporary wafer canvas
         H, W = self.ds_image.shape[:2]
-        S_base = min(self.V_w / W, self.V_h / H)
-        S = S_base * self.zoom
-
-        cx_m, cy_m = self.xc_ds, self.yc_ds
-        M_rot = cv2.getRotationMatrix2D((cx_m, cy_m), self.current_angle_deg, 1.0)
-        T_rot = np.eye(3)
-        T_rot[:2, :] = M_rot
-
-        K = np.array([cx_m, cy_m, 1.0])
-        K_rot = T_rot @ K
-        K_rx, K_ry = K_rot[0], K_rot[1]
-
-        tx = self.V_w / 2.0 - S * (K_rx + self.pan_x)
-        ty = self.V_h / 2.0 - S * (K_ry + self.pan_y)
-
-        T_view = np.array([[S, 0, tx], [0, S, ty], [0, 0, 1]])
-        T_final = T_view @ T_rot
-        M_final = T_final[:2, :]
-
-        display_img = cv2.warpAffine(
-            self.ds_image, M_final, (self.V_w, self.V_h),
+        ds_img_aligned = cv2.warpAffine(
+            self.ds_image, M_rs, (W, H),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30)
         )
 
-        if self.show_gds and self.gds_polygons:
-            S_x = (self.Rg / self.R_ds) * self.scale_mult
-            S_y = (self.Rg / self.R_ds) * self.scale_mult
+        # 2. Get GDS marker center mapped to base canvas coordinates (static, absolute)
+        gx_centered = -(gx - self.xg_c)
+        gy_centered = (gy - self.yg_c)
+        x_can_marker = (gx_centered / S_base) + self.xc_ds
+        y_can_marker = self.yc_ds - (gy_centered / S_base)
 
+        # 3. Dynamic crop size based on GDS scale
+        target_microns = 5000.0  # Physical width of the zoom window in um
+        crop_size = int(round(target_microns / S_base))
+        crop_size = max(30, min(crop_size, 400))
+        half_crop = crop_size / 2.0
+
+        # 4. Crop from the aligned wafer image centered at the fixed GDS marker base coordinates
+        x1 = int(round(x_can_marker - half_crop))
+        y1 = int(round(y_can_marker - half_crop))
+        x2 = x1 + crop_size
+        y2 = y1 + crop_size
+
+        crop_img = np.zeros((crop_size, crop_size, 3), dtype=np.uint8) + 30
+
+        src_x1 = max(0, x1)
+        src_y1 = max(0, y1)
+        src_x2 = min(W, x2)
+        src_y2 = min(H, y2)
+
+        dst_x1 = src_x1 - x1
+        dst_y1 = src_y1 - y1
+        dst_x2 = dst_x1 + (src_x2 - src_x1)
+        dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+        if (src_x2 > src_x1) and (src_y2 > src_y1):
+            crop_img[dst_y1:dst_y2, dst_x1:dst_x2] = ds_img_aligned[src_y1:src_y2, src_x1:src_x2]
+
+        resized_crop = cv2.resize(crop_img, (size, size), interpolation=cv2.INTER_LINEAR)
+
+        # Create copy overlay for translucent overlays
+        overlay = resized_crop.copy()
+        pixels_per_micron = size / float(crop_size * S_base)
+
+        for poly in marker_polys:
+            pts_scr = []
+            for gx_p, gy_p in poly:
+                dg_x = gx_p - gx
+                dg_y = gy_p - gy
+                
+                # Mirror x-axis to match base GDS-to-Canvas mapping
+                sx = int(round(size / 2.0 - dg_x * pixels_per_micron))
+                sy = int(round(size / 2.0 - dg_y * pixels_per_micron))
+                
+                # Removed individual vertex boundary checks to allow partial drawing of large polygons (bars)
+                pts_scr.append([sx, sy])
+                
+            if len(pts_scr) >= 2:
+                pts_scr = np.array(pts_scr, dtype=np.int32)
+                # Fill the alignment marker inside the overlay
+                cv2.fillPoly(overlay, [pts_scr], color=(0, 255, 0))
+                # Draw the border outline inside the overlay
+                cv2.polylines(overlay, [pts_scr], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+
+        # Blend the GDS overlay layer into the raw video crop with transparency
+        alpha = 0.35  # Translucency level
+        cv2.addWeighted(overlay, alpha, resized_crop, 1.0 - alpha, 0, resized_crop)
+
+        # Draw a fixed yellow crosshair in the center of the zoom window
+        cv2.drawMarker(resized_crop, (size // 2, size // 2), (0, 255, 255), cv2.MARKER_CROSS, 15, 1)
+        return resized_crop
+
+    def update_marker_zooms(self):
+        """Updates the zoomed-in views inside the Marker Assistant panel."""
+        if not hasattr(self, "markers") or not self.markers:
+            self.draw_placeholder(self.left_zoom_canvas, "No GDS Markers")
+            self.draw_placeholder(self.right_zoom_canvas, "No GDS Markers")
+            return
+
+        left_list = self.markers.get("left", [])
+        right_list = self.markers.get("right", [])
+
+        # Process Left Markers (Size 220)
+        if left_list:
+            # Center the zoom panel specifically on the circles since they represent the localized alignment grid
+            circles_l = [m for m in left_list if m["type"] == "circle"]
+            target_list_l = circles_l if circles_l else left_list
+            left_cx = np.mean([m["center"][0] for m in target_list_l])
+            left_cy = np.mean([m["center"][1] for m in target_list_l])
+            
+            polys = [np.array(m["polygon"]) for m in left_list]
+            img = self.get_zoomed_marker_image((left_cx, left_cy), polys, size=220)
+            self.display_on_canvas(self.left_zoom_canvas, img, "left_tk")
+        else:
+            self.draw_placeholder(self.left_zoom_canvas, "No Left Markers Found")
+
+        # Process Right Markers (Size 220)
+        if right_list:
+            # Center on circles for the right marker group as well
+            circles_r = [m for m in right_list if m["type"] == "circle"]
+            target_list_r = circles_r if circles_r else right_list
+            right_cx = np.mean([m["center"][0] for m in target_list_r])
+            right_cy = np.mean([m["center"][1] for m in target_list_r])
+            
+            polys = [np.array(m["polygon"]) for m in right_list]
+            img = self.get_zoomed_marker_image((right_cx, right_cy), polys, size=220)
+            self.display_on_canvas(self.right_zoom_canvas, img, "right_tk")
+        else:
+            self.draw_placeholder(self.right_zoom_canvas, "No Right Markers Found")
+
+    def display_on_canvas(self, canvas: tk.Canvas, cv_img: np.ndarray, cache_name: str):
+        rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_img)
+        tk_img = ImageTk.PhotoImage(pil_img)
+        setattr(self, cache_name, tk_img)  # Retain reference to prevent garbage collection
+        canvas.delete("all")
+        canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
+
+    def draw_placeholder(self, canvas: tk.Canvas, text: str):
+        canvas.delete("all")
+        canvas.create_text(110, 110, text=text, fill="#888888", font=("Helvetica", 9))
+
+    def render(self):
+        H, W = self.ds_image.shape[:2]
+        S_base_canvas = min(self.V_w / W, self.V_h / H)
+        S = S_base_canvas * self.zoom
+
+        # Compute dynamic image warp (Alignment transforms only: scale, rotate, translate)
+        M_rs = cv2.getRotationMatrix2D((self.xc_ds, self.yc_ds), self.current_angle_deg, self.scale_mult)
+        S_base = self.Rg / self.R_ds
+        dx_can = -self.offset_x / S_base
+        dy_can = self.offset_y / S_base
+        M_rs[0, 2] += dx_can
+        M_rs[1, 2] += dy_can
+
+        # Homogeneous representation to incorporate canvas pan and zoom on warped image
+        T_align = np.eye(3)
+        T_align[:2, :] = M_rs
+
+        # Viewport scale and pan (centers xc_ds, yc_ds with pan and zoom)
+        tx = self.V_w / 2.0 - S * (self.xc_ds + self.pan_x)
+        ty = self.V_h / 2.0 - S * (self.yc_ds + self.pan_y)
+        T_view = np.array([[S, 0, tx], [0, S, ty], [0, 0, 1]])
+
+        # Final composite transform for the camera image
+        T_final_img = T_view @ T_align
+        M_final_img = T_final_img[:2, :]
+
+        # Warp wafer image to viewport screen space
+        display_img = cv2.warpAffine(
+            self.ds_image, M_final_img, (self.V_w, self.V_h),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30)
+        )
+
+        # Draw GDS polygons (which stay completely static relative to alignment transforms)
+        if self.show_gds and self.gds_polygons:
             for poly in self.gds_polygons:
                 if len(poly) > 300:
                     poly = poly[::max(1, len(poly) // 300)]
 
                 pts_scr = []
                 for gx, gy in poly:
-                    gx_eff = -(gx - self.xg_c)
-                    gx_off = gx_eff - self.offset_x
-                    gy_off = (gy - self.yg_c) - self.offset_y
+                    # Convert to static base canvas space:
+                    gx_centered = -(gx - self.xg_c)
+                    gy_centered = (gy - self.yg_c)
+                    x_can = (gx_centered / S_base) + self.xc_ds
+                    y_can = self.yc_ds - (gy_centered / S_base)
 
-                    dy = gy_off / S_y
-                    dx = (gx_off - self.shear * gy_off) / S_x
-
-                    x_can = dx + self.xc_ds
-                    y_can = self.yc_ds - dy
-
+                    # Map to screen using viewport pan/zoom:
                     scr_x = int(S * x_can + tx)
                     scr_y = int(S * y_can + ty)
 
@@ -1020,6 +1240,9 @@ class ManualAlignApp:
         )
         self.status_label.config(text=status_text)
 
+        # Draw alignment marker previews in assistant panel
+        self.update_marker_zooms()
+
     def confirm(self):
         self.result_angle_rad = self.current_angle_rad
         self.result_tx = self.offset_x
@@ -1035,12 +1258,12 @@ class ManualAlignApp:
         self.root.destroy()
 
 
-def run_manual_alignment(ds_canvas, config, xc_ds, yc_ds, R_ds, ds_factor, tile_ext, initial_angle_rad, gds_polygons, gds_R, map_mode=False, gds_center=(0.0, 0.0), shear=0.0):
+def run_manual_alignment(ds_canvas, config, xc_ds, yc_ds, R_ds, ds_factor, tile_ext, initial_angle_rad, gds_polygons, gds_R, map_mode=False, gds_center=(0.0, 0.0), shear=0.0, markers=None):
     root = tk.Tk()
     app = ManualAlignApp(
         root, ds_canvas, xc_ds, yc_ds, R_ds, ds_factor,
         gds_polygons, gds_R, initial_angle_rad, map_mode=map_mode,
-        gds_center=gds_center, shear=shear
+        gds_center=gds_center, shear=shear, markers=markers
     )
     root.protocol("WM_DELETE_WINDOW", app.cancel)
     root.mainloop()
@@ -1048,7 +1271,7 @@ def run_manual_alignment(ds_canvas, config, xc_ds, yc_ds, R_ds, ds_factor, tile_
 
 
 # ===========================================================================
-# 7. INTERACTIVE DEVICE DEFECT MAPPER TOOL (formerly extract_cells.py block)
+# 7. INTERACTIVE DEVICE DEFECT MAPPER TOOL
 # ===========================================================================
 
 # Bounding box limits for monitors
@@ -1353,7 +1576,7 @@ class DeviceDefectMapperTool:
             sc_x2, sc_y2 = int((x_tl + w) * scale_down_x), int((y_tl + h) * scale_down_y)
             
             color = CLASS_COLORS.get(box_type, (255, 255, 255))
-            cv2.rectangle(self.canvas, (sc_x1, sc_y1), (sc_x2, sc_y2), color, 2)
+            cv2.rectangle(self.canvas, (sc_x1, sc_y1), (sc_x2, sc_y2), color, 3) # Slightly thicker borders
             cv2.putText(self.canvas, f"{box_type} (GDS X:{box.get('center_x_um', 0.0):.1f}, Y:{box.get('center_y_um', 0.0):.1f})", 
                         (sc_x1, sc_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
@@ -1384,7 +1607,7 @@ class DeviceDefectMapperTool:
                 self.current_pt = (clamped_x, clamped_y)
                 
                 temp_frame = self.canvas.copy()
-                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 255, 255), 1)
+                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 255, 255), 2) # Slightly thicker borders
                 cv2.imshow("Device Defect Register", temp_frame)
 
         elif event == cv2.EVENT_LBUTTONUP:
@@ -1401,7 +1624,7 @@ class DeviceDefectMapperTool:
                     return
 
                 temp_frame = self.canvas.copy()
-                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 165, 255), 2)
+                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 165, 255), 3) # Slightly thicker borders
                 cv2.putText(temp_frame, "CHOOSE CLASS [1-5] (or Esc to cancel)", 
                             (min(self.start_pt[0], self.current_pt[0]), min(self.start_pt[1], self.current_pt[1]) - 8), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
@@ -1484,7 +1707,7 @@ class DeviceDefectMapperTool:
                     height_um = (box_h_px / float(self.native_h)) * gds_h
 
                     self.annotations[filename].append({
-                        "type": assigned_class,
+                        "type": "circle" if is_circle else "bar", # Not applicable to direct defect labeling, preserved for context
                         "box_px": [orig_x1, orig_y1, box_w_px, box_h_px],
                         "center_x_um": round(center_x_um, 3),
                         "center_y_um": round(center_y_um, 3),
@@ -1512,13 +1735,25 @@ class DeviceDefectMapperTool:
             cell_img = cv2.imread(str(cell_entry["filepath"]))
             if cell_img is None: continue
 
+            # Settings for prominent labels/boxes
             cell_boxes = self.annotations.get(filename, [])
+            box_padding = 40  
+            box_thickness = 16  # Slightly thicker border for output stitch layout
+
             for box in cell_boxes:
                 box_type = box["type"]
                 x, y, w, h = box["box_px"]
                 color = CLASS_COLORS.get(box_type, (255, 255, 255))
-                cv2.rectangle(cell_img, (x, y), (x + w, y + h), color, 6)
-                cv2.putText(cell_img, box_type, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3, cv2.LINE_AA)
+                
+                # Prominent box with padding
+                p_x1 = max(0, x - box_padding)
+                p_y1 = max(0, y - box_padding)
+                p_x2 = min(cell_img.shape[1], x + w + box_padding)
+                p_y2 = min(cell_img.shape[0], y + h + box_padding)
+                
+                cv2.rectangle(cell_img, (p_x1, p_y1), (p_x2, p_y2), color, box_thickness)
+                cv2.putText(cell_img, box_type.upper(), (p_x1, p_y1 - 15), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 5, cv2.LINE_AA)
 
             corners_gds = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
             pts_img = []
@@ -1753,6 +1988,9 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
     try:
         canvas_xc, canvas_yc, canvas_R, flat_angle = detect_wafer_on_canvas(ds_canvas, ds_factor)
 
+        # Parse Layer 4 Alignment markers from GDS file
+        markers = parse_alignment_markers(config_run["gds_path"])
+
         if args.manual:
             flat_angle, x_offset_um, y_offset_um, scale_mult = run_manual_alignment(
                 ds_canvas,
@@ -1767,7 +2005,8 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
                 gds_R,
                 map_mode=True,
                 gds_center=(gds_xc, gds_yc),
-                shear=float(config_run.get("shear", 0.0))
+                shear=float(config_run.get("shear", 0.0)),
+                markers=markers
             )
 
         flat_angle = float(flat_angle)
@@ -1902,7 +2141,7 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
 
             angle_deg = flat_angle * 180.0 / np.pi
             M = cv2.getRotationMatrix2D(crop_center, angle_deg, 1.0)
-            rotated_local_canvas = cv2.warpAffine(local_canvas, M, (local_w, local_h), flags=cv2.INTER_LANCZOS4)
+            rotated_local_canvas = cv2.warpAffine(local_canvas, M, (local_w, local_h), flags=cv2.INTER_LINEAR)
 
             pts_homogeneous = np.column_stack([pts_canvas[:, 0] - x1, pts_canvas[:, 1] - y1, np.ones(4)])
             pts_rotated_local = (M @ pts_homogeneous.T).T
