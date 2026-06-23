@@ -239,7 +239,7 @@ def robust_vertical_profile_flat(gray_img, xc_ds, yc_ds, R_ds, h_img, w_img, is_
             grad = gradients[i]
 
             if not is_inverted:
-                if Math_grad := grad < -5.0 and intensity > 90 and (15 <= next_intensity <= 75):
+                if grad < -5.0 and intensity > 90 and (15 <= next_intensity <= 75):
                     y_edge = y_start_scan + i + 1
                     profile_pts.append([x, y_edge])
                     break
@@ -556,7 +556,7 @@ def parse_alignment_markers(gds_path: str) -> dict[str, list[dict]]:
             if is_circle or is_bar:
                 marker_info = {
                     "type": "circle" if is_circle else "bar",
-                    "bbox": (float(min_x), float(min_y), float(max_x), float(max_y)) if 'min_x' in locals() else (float(min_pt[0]), float(min_pt[1]), float(max_pt[0]), float(max_pt[1])),
+                    "bbox": (float(min_pt[0]), float(min_pt[1]), float(max_pt[0]), float(max_pt[1])),
                     "center": (float(cx), float(cy)),
                     "polygon": pts.tolist()
                 }
@@ -1245,8 +1245,9 @@ class ManualAlignApp:
 
     def confirm(self):
         self.result_angle_rad = self.current_angle_rad
-        self.result_tx = self.offset_x
-        self.result_ty = self.offset_y
+        # Invert translations to match WaferTransformer coordinate system expectations
+        self.result_tx = -self.offset_x
+        self.result_ty = -self.offset_y
         self.result_scale_mult = self.scale_mult
         self.root.destroy()
 
@@ -1707,7 +1708,7 @@ class DeviceDefectMapperTool:
                     height_um = (box_h_px / float(self.native_h)) * gds_h
 
                     self.annotations[filename].append({
-                        "type": "circle" if is_circle else "bar", # Not applicable to direct defect labeling, preserved for context
+                        "type": assigned_class,
                         "box_px": [orig_x1, orig_y1, box_w_px, box_h_px],
                         "center_x_um": round(center_x_um, 3),
                         "center_y_um": round(center_y_um, 3),
