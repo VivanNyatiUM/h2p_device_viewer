@@ -3,7 +3,7 @@
 wafer_alignment_and_extraction.py
 =================================
 A completely unified, standalone wafer metrology, GDS cell extraction, 
-and interactive defect-labeling tool. 
+and interactive defect-labeling tool. (All horizontal mirroring removed, Left/Right Direct Mapping)
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import cv2
 import gdstk
 from PIL import Image, ImageTk
 
-# Tkinter imports for interactive GUI components
 import tkinter as tk
 from tkinter import ttk
 
@@ -163,7 +162,6 @@ def robust_circle_fit(points, outlier_pct=0.012, max_iters=5):
     dists = np.linalg.norm(pts - np.array([xc, yc]), axis=1)
     mean_residual = float(np.mean(np.abs(dists - R)))
 
-    # Anisotropy check: compare horizontal vs vertical residual spread
     dx = pts[:, 0] - xc
     dy = pts[:, 1] - yc
     h_mask = np.abs(dx) > np.abs(dy)
@@ -421,7 +419,6 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
 
     xc_ds, yc_ds, R_ds, circle_residual = robust_circle_fit(top_half_pts, outlier_pct=0.012, max_iters=5)
 
-    # Core Detection Strategy 1: Vertical scanning profile
     profile_pts = robust_vertical_profile_flat(gray, xc_ds, yc_ds, R_ds, h_img, w_img, is_inverted=is_inverted)
     if len(profile_pts) >= 20:
         for _ in range(5):
@@ -437,12 +434,10 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
         alpha = np.arctan(slope_profile)
         return xc_ds / ds_factor, yc_ds / ds_factor, R_ds / ds_factor, alpha
 
-    # Core Detection Strategy 2: Radial geometry bounds
     flat_pts, alpha, fit_residual = geometry_based_flat_fit(circular_pts, xc_ds, yc_ds, R_ds)
     if flat_pts is not None and len(flat_pts) >= 10:
         return xc_ds / ds_factor, yc_ds / ds_factor, R_ds / ds_factor, alpha
 
-    # Core Detection Strategy 3: Polar grid sector sweep
     dx = circular_pts[:, 0] - xc_ds
     dy = circular_pts[:, 1] - yc_ds
     dists = np.sqrt(dx ** 2 + dy ** 2)
@@ -465,59 +460,140 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
 
 
 # ===========================================================================
-# 3. GDS PARSING HELPER MODULES
+# 3. GDS PARSING HELPER MODULES WITH OUTLINE EXTRACTION
 # ===========================================================================
 
-def parse_gds_wafer_boundary(path, layer=0, datatype=0):
-    """Parses design file geometry boundaries to find absolute radius."""
+def parse_gds_wafer_boundary(path, layer=1, datatype=0):
+    """
+    Parses design file wafer boundaries by finding the absolute largest 
+    polygon by area in the entire GDS layout globally, completely bypassing config.json.
+    """
     lib = gdstk.read_gds(path)
     top_cells = lib.top_level()
     if not top_cells:
         raise ValueError("No top-level cells found in GDS.")
     cell = top_cells[0]
+    cell.flatten()
 
     trapezoid = getattr(np, "trapezoid", getattr(np, "trapz", None))
     if trapezoid is None:
         raise ImportError("Neither np.trapezoid nor np.trapz was found in this NumPy installation.")
 
-    best = None
+    best_poly = None
+    best_pts = None
     best_area = 0
-    for poly in cell.get_polygons(layer=layer, datatype=datatype):
+
+    # Scan all polygons globally in the design to locate the outer wafer boundary
+    for poly in cell.polygons:
         pts = poly.points
         area = float(np.abs(trapezoid(pts[:, 1], pts[:, 0])))
         if area > best_area:
             best_area = area
-            best = pts
+            best_poly = poly
+            best_pts = pts
 
-    if best is None:
-        raise ValueError(f"No polygons found on layer {layer} datatype {datatype}.")
+    if best_poly is None:
+        raise ValueError("No polygons found in GDS file.")
 
-    xc = float(np.mean(best[:, 0]))
-    yc = float(np.mean(best[:, 1]))
-    R  = float(np.mean(np.sqrt((best[:, 0] - xc)**2 + (best[:, 1] - yc)**2)))
+    xc = float(np.mean(best_pts[:, 0]))
+    yc = float(np.mean(best_pts[:, 1]))
+    R  = float(np.mean(np.sqrt((best_pts[:, 0] - xc)**2 + (best_pts[:, 1] - yc)**2)))
+    
+    print(f"  [Wafer Boundary Parser] Automatically selected Layer {best_poly.layer}, Datatype {best_poly.datatype} (Area: {best_area:.2e} um^2) as wafer boundary.")
     return xc, yc, R
 
 
-def get_layer0_polygons(path):
-    """Retrieves all polygon geometries sitting on GDS layer 0."""
-    lib = gdstk.read_gds(path)
+def get_gds_overlay_polygons(path, config):
+    """
+    Extracts wireframe outlines of GDS cells/dies, wafer boundaries, and alignment markers.
+    Completely hardcoded to inspect Layer 1 and Layer 4, bypassing config.json layer parameters.
+    """
+    try:
+        lib = gdstk.read_gds(path)
+    except Exception as e:
+        print(f"Error reading GDS for overlay extraction: {e}")
+        return []
+
     top_cells = lib.top_level()
     if not top_cells:
-        raise ValueError("No top-level cells found in GDS.")
+        return []
     cell = top_cells[0]
 
-    polygons = []
-    for poly in cell.get_polygons():
-        if poly.layer == 0:
-            polygons.append(poly.points.astype(np.float64))
+    overlay_polygons = []
+    
+    # 1. Isolate the wafer boundary circle (use native Cell.copy to prevent pickling crash) [1.1.1]
+    flat_cell = cell.copy("TEMP_FLAT")
+    flat_cell.flatten()
+    
+    # Identify the largest overall polygon in the GDS to act as the wafer boundary circle
+    best_circle_poly = None
+    best_area = 0
+    trapezoid = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    if trapezoid is None:
+        raise ImportError("Neither np.trapezoid nor np.trapz was found in this NumPy installation.")
 
-    return polygons
+    for poly in flat_cell.polygons:
+        p_pts = poly.points.astype(np.float64)
+        area = float(np.abs(trapezoid(p_pts[:, 1], p_pts[:, 0])))
+        if area > best_area:
+            best_area = area
+            best_circle_poly = p_pts
+                    
+    if best_circle_poly is not None:
+        overlay_polygons.append(best_circle_poly)
+
+    # 2. Extract clean Layer 4 alignment markers (circles and bars)
+    # This directly avoids any Layer 1 cut-outs or noisy shapes.
+    for poly in flat_cell.polygons:
+        if poly.layer == 4:
+            pts = poly.points.astype(np.float64)
+            min_pt = np.min(pts, axis=0)
+            max_pt = np.max(pts, axis=0)
+            w = max_pt[0] - min_pt[0]
+            h = max_pt[1] - min_pt[1]
+            
+            dim_max = max(w, h)
+            dim_min = min(w, h)
+            
+            is_circle = (280.0 <= w <= 350.0) and (280.0 <= h <= 350.0)
+            is_bar = (dim_max > 2000.0) and (100.0 <= dim_min <= 500.0)
+            
+            if is_circle or is_bar:
+                overlay_polygons.append(pts)
+
+    # 3. Extract target device cells from Layer 4
+    polys = [p.points.astype(np.float64) for p in flat_cell.polygons if p.layer == 4]
+    if not polys:
+        polys = [p.points.astype(np.float64) for p in flat_cell.polygons if p.layer == 1]
+
+    # 4. Generate clean, lightweight outer rectangular boundaries of each device cell
+    print("  [GDS Overlay Optimizer] Generating clean die boundary frames...")
+    if polys:
+        gds_R = 150000.0
+        if best_circle_poly is not None:
+            cx = float(np.mean(best_circle_poly[:, 0]))
+            cy = float(np.mean(best_circle_poly[:, 1]))
+            gds_R = float(np.mean(np.sqrt((best_circle_poly[:, 0] - cx)**2 + (best_circle_poly[:, 1] - cy)**2)))
+        
+        cells_list = get_gds_cells_list(polys, gds_R)
+        for c in cells_list:
+            min_x, min_y, max_x, max_y = c["bbox"]
+            box = np.array([
+                [min_x, min_y],
+                [max_x, min_y],
+                [max_x, max_y],
+                [min_x, max_y]
+            ], dtype=np.float64)
+            overlay_polygons.append(box)
+
+    print(f"  [GDS Overlay Optimizer] Created {len(overlay_polygons)} clean wireframe outlines for display overlay.")
+    return overlay_polygons
 
 
 def parse_alignment_markers(gds_path: str) -> dict[str, list[dict]]:
     """
-    Parses Layer 4 alignment markers to find Left and Right groups.
-    An orientation-agnostic check identifies circles and both horizontal/vertical bars.
+    Parses Layer 4 alignment markers.
+    No horizontal mirroring applies to left/right classification bounds.
     """
     try:
         lib = gdstk.read_gds(gds_path)
@@ -529,12 +605,10 @@ def parse_alignment_markers(gds_path: str) -> dict[str, list[dict]]:
     if not top_cells:
         return {"left": [], "right": []}
     cell = top_cells[0]
+    cell.flatten()
 
     left_markers = []
     right_markers = []
-
-    # Flatten cell references to ensure we extract absolute global coordinate geometries
-    cell.flatten()
 
     for poly in cell.polygons:
         if poly.layer == 4:
@@ -546,12 +620,11 @@ def parse_alignment_markers(gds_path: str) -> dict[str, list[dict]]:
             cx = (min_pt[0] + max_pt[0]) / 2.0
             cy = (min_pt[1] + max_pt[1]) / 2.0
 
-            # Orientation-agnostic calculations
             dim_max = max(w, h)
             dim_min = min(w, h)
 
             is_circle = (280.0 <= w <= 350.0) and (280.0 <= h <= 350.0)
-            is_bar = (dim_max > 1500.0) and (80.0 <= dim_min <= 600.0)
+            is_bar = (dim_max > 2000.0) and (100.0 <= dim_min <= 500.0)
 
             if is_circle or is_bar:
                 marker_info = {
@@ -561,9 +634,8 @@ def parse_alignment_markers(gds_path: str) -> dict[str, list[dict]]:
                     "polygon": pts.tolist()
                 }
                 
-                # Correcting the Left/Right Flip:
-                # GDS X > 0 corresponds to the Left viewport due to mirror mapping (canvas_x = -g_x)
-                if cx > 0:
+                # Direct Mapping: negative design space represents physical Left
+                if cx < 0:
                     left_markers.append(marker_info)
                 else:
                     right_markers.append(marker_info)
@@ -642,7 +714,7 @@ def generate_downscaled_stitch(folder, config):
 # ===========================================================================
 
 class WaferTransformer:
-    """Handles isomorphic bidirection coordinate mappings: canvas px <=> GDS um."""
+    """Handles isomorphic bidirectional coordinate mappings: canvas px <=> GDS um."""
     def __init__(
         self,
         canvas_center: tuple[float, float],
@@ -709,7 +781,8 @@ class WaferTransformer:
         gy_eff = dy_rot * self.S_y + self.y_offset
         gx_eff = dx_rot * self.S_x + self.shear * (dy_rot * self.S_y) + self.x_offset
 
-        gx_centered = -gx_eff
+        # Mapping is 1:1 direct (no horizontal mirroring applied)
+        gx_centered = gx_eff
         gy_centered = gy_eff
 
         x_gds = gx_centered + self.xg_c
@@ -720,7 +793,8 @@ class WaferTransformer:
         gx_centered = x_gds - self.xg_c
         gy_centered = y_gds - self.yg_c
 
-        gx_eff = -gx_centered
+        # Mapping is 1:1 direct (no horizontal mirroring applied)
+        gx_eff = gx_centered
         gy_eff = gy_centered
 
         dy_rot = (gy_eff - self.y_offset) / self.S_y
@@ -736,7 +810,8 @@ class WaferTransformer:
     def transform_gds_to_target_img(self, x_gds: float, y_gds: float, out_size: int):
         half  = out_size / 2.0
         scale = (0.925 * half) / self.Rg
-        gx_centered = -(x_gds - self.xg_c)
+        # Horizontal mapping is direct
+        gx_centered = x_gds - self.xg_c
         x_img = half + gx_centered * scale
         y_img = half - (y_gds - self.yg_c) * scale
         return x_img, y_img
@@ -799,7 +874,6 @@ class ManualAlignApp:
         self.offset_y = 0.0
         self.scale_mult = 1.0
 
-        # Narrowed workspace canvas (800 width instead of 1000) to trim empty margins
         self.V_w = 800
         self.V_h = 600
 
@@ -818,39 +892,33 @@ class ManualAlignApp:
 
     def setup_ui(self):
         self.root.title("Interactive GDS Alignment Calibration Workspace")
-        self.root.geometry("1420x680")  # Standardized geometry width
+        self.root.geometry("1420x680")
         self.root.resizable(False, False)
 
         style = ttk.Style()
         style.theme_use("clam")
 
-        # Sidebar Controls (Column 0)
         self.sidebar = ttk.Frame(self.root, padding=15, width=340)
         self.sidebar.grid(row=0, column=0, sticky="ns", padx=5, pady=5)
         self.sidebar.grid_propagate(False)
 
-        # Main Workspace Canvas (Column 1 - Width 800)
         self.canvas = tk.Canvas(self.root, width=self.V_w, height=self.V_h, bg="#1e1e1e", highlightthickness=0)
         self.canvas.grid(row=0, column=1, padx=5, pady=10)
 
-        # Integrated Marker Alignment Assistant (Column 2)
         self.marker_panel = ttk.Frame(self.root, padding=10, width=250)
         self.marker_panel.grid(row=0, column=2, sticky="ns", padx=5, pady=5)
         self.marker_panel.grid_propagate(False)
 
         ttk.Label(self.marker_panel, text="Marker Alignment Assistant", font=("Helvetica", 11, "bold")).pack(anchor="n", pady=(0, 10))
 
-        # Left Marker Display Box
         ttk.Label(self.marker_panel, text="Left Marker (GDS Layer 4)", font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(5, 2))
         self.left_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#151515", highlightthickness=1, highlightbackground="#444")
         self.left_zoom_canvas.pack(anchor="w", pady=(0, 15))
 
-        # Right Marker Display Box
         ttk.Label(self.marker_panel, text="Right Marker (GDS Layer 4)", font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(5, 2))
         self.right_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#151515", highlightthickness=1, highlightbackground="#444")
         self.right_zoom_canvas.pack(anchor="w", pady=(0, 15))
 
-        # UI Controls in Sidebar
         ttk.Label(self.sidebar, text="1. Rotation (Degrees)", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 2))
         rot_frame = ttk.Frame(self.sidebar)
         rot_frame.pack(fill="x", pady=(0, 10))
@@ -872,7 +940,7 @@ class ManualAlignApp:
         self.tx_var = tk.StringVar(value=f"{self.offset_x:.1f}")
         self.tx_entry = ttk.Entry(tx_frame, textvariable=self.tx_var, width=12)
         self.tx_entry.pack(side="left", padx=(0, 5))
-        ttk.Button(tx_frame, text="Apply", command=self.apply_tx).pack(side="left")
+        ttk.Button(tx_frame, text="Apply", command=self.apply_rotation).pack(side="left") # Apply handles overall state update
 
         tx_btn_frame = ttk.Frame(self.sidebar)
         tx_btn_frame.pack(fill="x", pady=(0, 15))
@@ -887,7 +955,7 @@ class ManualAlignApp:
         self.ty_var = tk.StringVar(value=f"{self.offset_y:.1f}")
         self.ty_entry = ttk.Entry(ty_frame, textvariable=self.ty_var, width=12)
         self.ty_entry.pack(side="left", padx=(0, 5))
-        ttk.Button(ty_frame, text="Apply", command=self.apply_ty).pack(side="left")
+        ttk.Button(ty_frame, text="Apply", command=self.apply_rotation).pack(side="left")
 
         ty_btn_frame = ttk.Frame(self.sidebar)
         ty_btn_frame.pack(fill="x", pady=(0, 15))
@@ -902,7 +970,7 @@ class ManualAlignApp:
         self.scale_var = tk.StringVar(value=f"{self.scale_mult:.5f}")
         self.scale_entry = ttk.Entry(sc_frame, textvariable=self.scale_var, width=12)
         self.scale_entry.pack(side="left", padx=(0, 5))
-        ttk.Button(sc_frame, text="Apply", command=self.apply_scale).pack(side="left")
+        ttk.Button(sc_frame, text="Apply", command=self.apply_rotation).pack(side="left")
 
         sc_btn_frame = ttk.Frame(self.sidebar)
         sc_btn_frame.pack(fill="x", pady=(0, 20))
@@ -926,9 +994,9 @@ class ManualAlignApp:
         self.canvas.bind("<Button-5>", lambda e: self.adjust_zoom(1.0 / 1.15))
 
         self.rot_entry.bind("<Return>", lambda e: self.apply_rotation())
-        self.tx_entry.bind("<Return>", lambda e: self.apply_tx())
-        self.ty_entry.bind("<Return>", lambda e: self.apply_ty())
-        self.scale_entry.bind("<Return>", lambda e: self.apply_scale())
+        self.tx_entry.bind("<Return>", lambda e: self.apply_rotation())
+        self.ty_entry.bind("<Return>", lambda e: self.apply_rotation())
+        self.scale_entry.bind("<Return>", lambda e: self.apply_rotation())
 
         self.root.bind("<Control-equal>", lambda e: self.adjust_zoom(1.15))
         self.root.bind("<Control-plus>", lambda e: self.adjust_zoom(1.15))
@@ -937,11 +1005,12 @@ class ManualAlignApp:
 
     def apply_rotation(self):
         try:
-            val = float(self.rot_var.get())
-            if -45.0 <= val <= 45.0:
-                self.current_angle_deg = val
-                self.current_angle_rad = val * np.pi / 180.0
-                self.render()
+            self.current_angle_deg = float(self.rot_var.get())
+            self.current_angle_rad = self.current_angle_deg * np.pi / 180.0
+            self.offset_x = float(self.tx_var.get())
+            self.offset_y = float(self.ty_var.get())
+            self.scale_mult = float(self.scale_var.get())
+            self.render()
         except ValueError:
             pass
 
@@ -951,38 +1020,15 @@ class ManualAlignApp:
         self.rot_var.set(f"{self.current_angle_deg:.3f}")
         self.render()
 
-    def apply_tx(self):
-        try:
-            self.offset_x = float(self.tx_var.get())
-            self.render()
-        except ValueError:
-            pass
-
     def adjust_tx(self, offset):
         self.offset_x += offset
         self.tx_var.set(f"{self.offset_x:.1f}")
         self.render()
 
-    def apply_ty(self):
-        try:
-            self.offset_y = float(self.ty_var.get())
-            self.render()
-        except ValueError:
-            pass
-
     def adjust_ty(self, offset):
         self.offset_y += offset
         self.ty_var.set(f"{self.offset_y:.1f}")
         self.render()
-
-    def apply_scale(self):
-        try:
-            val = float(self.scale_var.get())
-            if 0.5 <= val <= 2.0:
-                self.scale_mult = val
-                self.render()
-        except ValueError:
-            pass
 
     def adjust_scale(self, offset):
         self.scale_mult = np.clip(self.scale_mult + offset, 0.5, 2.0)
@@ -1026,43 +1072,31 @@ class ManualAlignApp:
         self.render()
 
     def get_zoomed_marker_image(self, center_gds: tuple[float, float], marker_polys: list[np.ndarray], size: int = 220) -> np.ndarray:
-        """
-        Creates a cropped image of the physical canvas aligned with the specified GDS coordinate markers,
-        scaling the crop dynamically to fit a constant physical span.
-        The GDS overlay markers inside the zoom panel remain completely static (unaligned, unrotated, and untranslated),
-        while the underlying camera background rotates, scales, and translates to represent dynamic adjustments.
-        """
         gx, gy = center_gds
         S_base = self.Rg / self.R_ds
 
-        # 1. Compute the dynamic warp transformation of the wafer image
-        # This applies scaling, rotation, and translations purely to the wafer image
         M_rs = cv2.getRotationMatrix2D((self.xc_ds, self.yc_ds), self.current_angle_deg, self.scale_mult)
         dx_can = -self.offset_x / S_base
         dy_can = self.offset_y / S_base
         M_rs[0, 2] += dx_can
         M_rs[1, 2] += dy_can
 
-        # Generate a fully aligned temporary wafer canvas
         H, W = self.ds_image.shape[:2]
         ds_img_aligned = cv2.warpAffine(
             self.ds_image, M_rs, (W, H),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30)
         )
 
-        # 2. Get GDS marker center mapped to base canvas coordinates (static, absolute)
-        gx_centered = -(gx - self.xg_c)
-        gy_centered = (gy - self.yg_c)
+        gx_centered = gx - self.xg_c
+        gy_centered = gy - self.yg_c
         x_can_marker = (gx_centered / S_base) + self.xc_ds
         y_can_marker = self.yc_ds - (gy_centered / S_base)
 
-        # 3. Dynamic crop size based on GDS scale
-        target_microns = 5000.0  # Physical width of the zoom window in um
+        target_microns = 5000.0
         crop_size = int(round(target_microns / S_base))
         crop_size = max(30, min(crop_size, 400))
         half_crop = crop_size / 2.0
 
-        # 4. Crop from the aligned wafer image centered at the fixed GDS marker base coordinates
         x1 = int(round(x_can_marker - half_crop))
         y1 = int(round(y_can_marker - half_crop))
         x2 = x1 + crop_size
@@ -1084,8 +1118,6 @@ class ManualAlignApp:
             crop_img[dst_y1:dst_y2, dst_x1:dst_x2] = ds_img_aligned[src_y1:src_y2, src_x1:src_x2]
 
         resized_crop = cv2.resize(crop_img, (size, size), interpolation=cv2.INTER_LINEAR)
-
-        # Create copy overlay for translucent overlays
         overlay = resized_crop.copy()
         pixels_per_micron = size / float(crop_size * S_base)
 
@@ -1095,30 +1127,22 @@ class ManualAlignApp:
                 dg_x = gx_p - gx
                 dg_y = gy_p - gy
                 
-                # Mirror x-axis to match base GDS-to-Canvas mapping
-                sx = int(round(size / 2.0 - dg_x * pixels_per_micron))
+                sx = int(round(size / 2.0 + dg_x * pixels_per_micron))
                 sy = int(round(size / 2.0 - dg_y * pixels_per_micron))
-                
-                # Removed individual vertex boundary checks to allow partial drawing of large polygons (bars)
                 pts_scr.append([sx, sy])
                 
             if len(pts_scr) >= 2:
                 pts_scr = np.array(pts_scr, dtype=np.int32)
-                # Fill the alignment marker inside the overlay
                 cv2.fillPoly(overlay, [pts_scr], color=(0, 255, 0))
-                # Draw the border outline inside the overlay
                 cv2.polylines(overlay, [pts_scr], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
 
-        # Blend the GDS overlay layer into the raw video crop with transparency
-        alpha = 0.35  # Translucency level
+        alpha = 0.35
         cv2.addWeighted(overlay, alpha, resized_crop, 1.0 - alpha, 0, resized_crop)
-
-        # Draw a fixed yellow crosshair in the center of the zoom window
         cv2.drawMarker(resized_crop, (size // 2, size // 2), (0, 255, 255), cv2.MARKER_CROSS, 15, 1)
         return resized_crop
 
     def update_marker_zooms(self):
-        """Updates the zoomed-in views inside the Marker Assistant panel."""
+        """Updates zoomed-in views inside the Marker Assistant panel."""
         if not hasattr(self, "markers") or not self.markers:
             self.draw_placeholder(self.left_zoom_canvas, "No GDS Markers")
             self.draw_placeholder(self.right_zoom_canvas, "No GDS Markers")
@@ -1127,9 +1151,7 @@ class ManualAlignApp:
         left_list = self.markers.get("left", [])
         right_list = self.markers.get("right", [])
 
-        # Process Left Markers (Size 220)
         if left_list:
-            # Center the zoom panel specifically on the circles since they represent the localized alignment grid
             circles_l = [m for m in left_list if m["type"] == "circle"]
             target_list_l = circles_l if circles_l else left_list
             left_cx = np.mean([m["center"][0] for m in target_list_l])
@@ -1141,9 +1163,7 @@ class ManualAlignApp:
         else:
             self.draw_placeholder(self.left_zoom_canvas, "No Left Markers Found")
 
-        # Process Right Markers (Size 220)
         if right_list:
-            # Center on circles for the right marker group as well
             circles_r = [m for m in right_list if m["type"] == "circle"]
             target_list_r = circles_r if circles_r else right_list
             right_cx = np.mean([m["center"][0] for m in target_list_r])
@@ -1159,7 +1179,7 @@ class ManualAlignApp:
         rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb_img)
         tk_img = ImageTk.PhotoImage(pil_img)
-        setattr(self, cache_name, tk_img)  # Retain reference to prevent garbage collection
+        setattr(self, cache_name, tk_img)
         canvas.delete("all")
         canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
 
@@ -1172,7 +1192,6 @@ class ManualAlignApp:
         S_base_canvas = min(self.V_w / W, self.V_h / H)
         S = S_base_canvas * self.zoom
 
-        # Compute dynamic image warp (Alignment transforms only: scale, rotate, translate)
         M_rs = cv2.getRotationMatrix2D((self.xc_ds, self.yc_ds), self.current_angle_deg, self.scale_mult)
         S_base = self.Rg / self.R_ds
         dx_can = -self.offset_x / S_base
@@ -1180,26 +1199,21 @@ class ManualAlignApp:
         M_rs[0, 2] += dx_can
         M_rs[1, 2] += dy_can
 
-        # Homogeneous representation to incorporate canvas pan and zoom on warped image
         T_align = np.eye(3)
         T_align[:2, :] = M_rs
 
-        # Viewport scale and pan (centers xc_ds, yc_ds with pan and zoom)
         tx = self.V_w / 2.0 - S * (self.xc_ds + self.pan_x)
         ty = self.V_h / 2.0 - S * (self.yc_ds + self.pan_y)
         T_view = np.array([[S, 0, tx], [0, S, ty], [0, 0, 1]])
 
-        # Final composite transform for the camera image
         T_final_img = T_view @ T_align
         M_final_img = T_final_img[:2, :]
 
-        # Warp wafer image to viewport screen space
         display_img = cv2.warpAffine(
             self.ds_image, M_final_img, (self.V_w, self.V_h),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30)
         )
 
-        # Draw GDS polygons (which stay completely static relative to alignment transforms)
         if self.show_gds and self.gds_polygons:
             for poly in self.gds_polygons:
                 if len(poly) > 300:
@@ -1207,13 +1221,11 @@ class ManualAlignApp:
 
                 pts_scr = []
                 for gx, gy in poly:
-                    # Convert to static base canvas space:
-                    gx_centered = -(gx - self.xg_c)
+                    gx_centered = gx - self.xg_c
                     gy_centered = (gy - self.yg_c)
                     x_can = (gx_centered / S_base) + self.xc_ds
                     y_can = self.yc_ds - (gy_centered / S_base)
 
-                    # Map to screen using viewport pan/zoom:
                     scr_x = int(S * x_can + tx)
                     scr_y = int(S * y_can + ty)
 
@@ -1236,16 +1248,13 @@ class ManualAlignApp:
             f"Angle: {self.current_angle_deg:.3f}°\n"
             f"Zoom: {self.zoom:.2f}x\n"
             f"Pan: ({int(self.pan_x)}, {int(self.pan_y)})\n"
-            f"Mode: Alignment Active (Mirroring)"
+            f"Mode: Alignment Active"
         )
         self.status_label.config(text=status_text)
-
-        # Draw alignment marker previews in assistant panel
         self.update_marker_zooms()
 
     def confirm(self):
         self.result_angle_rad = self.current_angle_rad
-        # Invert translations to match WaferTransformer coordinate system expectations
         self.result_tx = -self.offset_x
         self.result_ty = -self.offset_y
         self.result_scale_mult = self.scale_mult
@@ -1275,16 +1284,15 @@ def run_manual_alignment(ds_canvas, config, xc_ds, yc_ds, R_ds, ds_factor, tile_
 # 7. INTERACTIVE DEVICE DEFECT MAPPER TOOL
 # ===========================================================================
 
-# Bounding box limits for monitors
 MAX_DISPLAY_WIDTH = 1200
 MAX_DISPLAY_HEIGHT = 750
 
 CLASS_COLORS = {
-    "blister": (0, 255, 0),       # Green
-    "tear": (255, 0, 0),          # Blue (BGR)
-    "delamination": (255, 0, 255),# Magenta
-    "particulate": (0, 0, 255),   # Red
-    "hole": (0, 255, 255)         # Yellow
+    "blister": (0, 255, 0),
+    "tear": (255, 0, 0),
+    "delamination": (255, 0, 255),
+    "particulate": (0, 0, 255),
+    "hole": (0, 255, 255)
 }
 
 KEY_MAPPING = {
@@ -1308,7 +1316,6 @@ class DeviceDefectMapperTool:
         self.gds_R = gds_R
         self.config = config
         
-        # Self-scaled display window width leaves horizontal room for 320px sidebar
         self.max_disp_w = 950
         self.max_disp_h = MAX_DISPLAY_HEIGHT
         
@@ -1331,7 +1338,6 @@ class DeviceDefectMapperTool:
 
         self.cell_files.sort(key=lambda x: (x["cell_data"]["row"], x["cell_data"]["col"]))
 
-        # Cache absolute GDS bounds across all devices to normalize wafer map coords
         self.all_min_x = min(c["cell_data"]["bbox"][0] for c in self.cell_files)
         self.all_min_y = min(c["cell_data"]["bbox"][1] for c in self.cell_files)
         self.all_max_x = max(c["cell_data"]["bbox"][2] for c in self.cell_files)
@@ -1446,14 +1452,11 @@ class DeviceDefectMapperTool:
         panel_width = 320
         self.canvas = np.zeros((self.display_height, self.display_width + panel_width, 3), dtype=np.uint8)
         self.canvas[:, :self.display_width] = self.img_disp
-
-        # Fill background of control panel
         self.canvas[:, self.display_width:] = 40
 
         cell_entry = self.cell_files[self.current_idx]
         filename = cell_entry["filename"]
 
-        # Draw Title & Navigation State inside side panel
         title_y = 35
         cv2.putText(self.canvas, "DEVICE METRIC STATUS", (self.display_width + 15, title_y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
@@ -1462,7 +1465,6 @@ class DeviceDefectMapperTool:
         cv2.putText(self.canvas, f"File: {filename}", (self.display_width + 15, title_y + 50), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
 
-        # Draw Legend block inside side panel
         legend_y = 120
         cv2.putText(self.canvas, "LEGEND GUIDE:", (self.display_width + 15, legend_y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
@@ -1480,7 +1482,6 @@ class DeviceDefectMapperTool:
             cv2.putText(self.canvas, label_txt, (self.display_width + 37, ly), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220, 220, 220), 1, cv2.LINE_AA)
 
-        # Keyboard shortcuts mapping list
         shortcuts_y = legend_y + 115
         cv2.putText(self.canvas, "SHORTCUTS:", (self.display_width + 15, shortcuts_y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
@@ -1498,7 +1499,6 @@ class DeviceDefectMapperTool:
             cv2.putText(self.canvas, shortcut_text, (self.display_width + 15, sy), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1, cv2.LINE_AA)
 
-        # --- WAFER MAP RENDER BLOCK ---
         map_size = 260
         map_padding = 15
         map_draw_size = map_size - 2 * map_padding
@@ -1508,7 +1508,6 @@ class DeviceDefectMapperTool:
         if map_y_start < 250:
             map_y_start = max(250, self.display_height - map_size - 5)
 
-        # Container outline for the wafer map
         cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), 
                       (map_x_start + map_size - 10, map_y_start + map_size - 10), (30, 30, 30), -1)
         cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), 
@@ -1523,7 +1522,6 @@ class DeviceDefectMapperTool:
             cell_filename = entry["filename"]
             min_x, min_y, max_x, max_y = cell_data["bbox"]
             
-            # Map coordinates normalized [0, 1] relative to design bounds
             norm_x1 = (min_x - self.all_min_x) / (self.gds_w + 1e-9)
             norm_y1 = (min_y - self.all_min_y) / (self.gds_h + 1e-9)
             norm_x2 = (max_x - self.all_min_x) / (self.gds_w + 1e-9)
@@ -1560,7 +1558,6 @@ class DeviceDefectMapperTool:
             if thickness == -1:
                 cv2.rectangle(self.canvas, (mx1, my1), (mx2, my2), (200, 200, 200) if is_current else (40, 40, 40), 1)
 
-        # Draw exclusion status text at standard bottom corner inside screen space
         if filename in self.exclusions:
             cv2.rectangle(self.canvas, (0, 0), (self.display_width, self.display_height), (0, 0, 255), 4)
             cv2.putText(self.canvas, "MARKED FOR EXCLUSION", (15, self.display_height - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
@@ -1577,7 +1574,7 @@ class DeviceDefectMapperTool:
             sc_x2, sc_y2 = int((x_tl + w) * scale_down_x), int((y_tl + h) * scale_down_y)
             
             color = CLASS_COLORS.get(box_type, (255, 255, 255))
-            cv2.rectangle(self.canvas, (sc_x1, sc_y1), (sc_x2, sc_y2), color, 3) # Slightly thicker borders
+            cv2.rectangle(self.canvas, (sc_x1, sc_y1), (sc_x2, sc_y2), color, 3)
             cv2.putText(self.canvas, f"{box_type} (GDS X:{box.get('center_x_um', 0.0):.1f}, Y:{box.get('center_y_um', 0.0):.1f})", 
                         (sc_x1, sc_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
@@ -1588,7 +1585,6 @@ class DeviceDefectMapperTool:
 
         if event == cv2.EVENT_LBUTTONDOWN:
             if x >= self.display_width:
-                # User clicked inside wafer map sidebar panel
                 for idx, bounds in enumerate(self.cell_map_bounds):
                     bx1, by1, bx2, by2 = bounds
                     if bx1 <= x <= bx2 and by1 <= y <= by2:
@@ -1602,13 +1598,12 @@ class DeviceDefectMapperTool:
 
         elif event == cv2.EVENT_MOUSEMOVE:
             if self.drawing:
-                # Clamp coordinates inside the bounds of the active cell crop space
                 clamped_x = max(0, min(x, self.display_width - 1))
                 clamped_y = max(0, min(y, self.display_height - 1))
                 self.current_pt = (clamped_x, clamped_y)
                 
                 temp_frame = self.canvas.copy()
-                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 255, 255), 2) # Slightly thicker borders
+                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 255, 255), 2)
                 cv2.imshow("Device Defect Register", temp_frame)
 
         elif event == cv2.EVENT_LBUTTONUP:
@@ -1625,19 +1620,17 @@ class DeviceDefectMapperTool:
                     return
 
                 temp_frame = self.canvas.copy()
-                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 165, 255), 3) # Slightly thicker borders
+                cv2.rectangle(temp_frame, self.start_pt, self.current_pt, (0, 165, 255), 3)
                 cv2.putText(temp_frame, "CHOOSE CLASS [1-5] (or Esc to cancel)", 
                             (min(self.start_pt[0], self.current_pt[0]), min(self.start_pt[1], self.current_pt[1]) - 8), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1, cv2.LINE_AA)
                 
-                # Render the prominent modal block warning inside the sidebar panel
-                # First, paint a solid dark-gray rectangle over the Y=100 to Y=340 interval to clear previous text
                 cv2.rectangle(temp_frame, (self.display_width + 5, 100), (self.display_width + 315, 340), (40, 40, 40), -1)
                 
                 box_y1 = 105
                 box_y2 = 335
-                cv2.rectangle(temp_frame, (self.display_width + 5, box_y1), (self.display_width + 315, box_y2), (0, 0, 180), -1) # Dark red fill
-                cv2.rectangle(temp_frame, (self.display_width + 5, box_y1), (self.display_width + 315, box_y2), (0, 255, 255), 2)  # Yellow border
+                cv2.rectangle(temp_frame, (self.display_width + 5, box_y1), (self.display_width + 315, box_y2), (0, 0, 180), -1)
+                cv2.rectangle(temp_frame, (self.display_width + 5, box_y1), (self.display_width + 315, box_y2), (0, 255, 255), 2)
                 
                 cv2.putText(temp_frame, "CHOOSE DEFECT TYPE!", (self.display_width + 15, box_y1 + 25), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
@@ -1736,17 +1729,15 @@ class DeviceDefectMapperTool:
             cell_img = cv2.imread(str(cell_entry["filepath"]))
             if cell_img is None: continue
 
-            # Settings for prominent labels/boxes
             cell_boxes = self.annotations.get(filename, [])
             box_padding = 40  
-            box_thickness = 16  # Slightly thicker border for output stitch layout
+            box_thickness = 16
 
             for box in cell_boxes:
                 box_type = box["type"]
                 x, y, w, h = box["box_px"]
                 color = CLASS_COLORS.get(box_type, (255, 255, 255))
                 
-                # Prominent box with padding
                 p_x1 = max(0, x - box_padding)
                 p_y1 = max(0, y - box_padding)
                 p_x2 = min(cell_img.shape[1], x + w + box_padding)
@@ -1769,14 +1760,13 @@ class DeviceDefectMapperTool:
             pt_x1 = int(round(tx_min))
             pt_y1 = int(round(ty_min))
             pt_x2 = int(round(tx_max))
-            pt_y2 = int(round(ty_max))
+            pt_y2 = int(round(tx_max))
 
             cell_w = pt_x2 - pt_x1
             cell_h = pt_y2 - pt_y1
 
             if cell_w > 0 and cell_h > 0:
-                flipped_cell = cv2.flip(cell_img, 1)
-                resized_cell = cv2.resize(flipped_cell, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+                resized_cell = cv2.resize(cell_img, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
                 composite_canvas[pt_y1:pt_y2, pt_x1:pt_x2] = resized_cell
 
         cv2.imwrite(self.output_stitch_path, composite_canvas, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -1835,9 +1825,12 @@ def get_gds_cells_list(polygons, gds_R):
         w = max_x - min_x
         h = max_y - min_y
         
+        # Filter to isolate only the 76 main cell boundaries.
+        # Die outlines are ~8310 x 8235 um.
+        # Markers and detailed annotations on Layer 4 are smaller (< 3000 um) and will be skipped.
         if w > 0.8 * (2 * gds_R) or h > 0.8 * (2 * gds_R):
             continue
-        if w < 100.0 or h < 100.0:
+        if w < 3000.0 or h < 3000.0:  # Threshold increased to filter out markers and text
             continue
             
         raw_cells.append({
@@ -1848,7 +1841,6 @@ def get_gds_cells_list(polygons, gds_R):
     if not raw_cells:
         return []
 
-    # Merge nested or concentric design masks belonging to the same die structure
     tol_merge = 0.05 * gds_R
     merged_cells = []
     
@@ -1881,7 +1873,6 @@ def get_gds_cells_list(polygons, gds_R):
 
     print(f"  [GDS Clustering] Merged {len(raw_cells)} design features into {len(merged_cells)} unique physical devices.")
 
-    # Sort centers into coordinate rows and columns
     centers = np.array([mc["center"] for mc in merged_cells])
     if len(centers) > 1:
         diffs_x = np.diff(np.sort(centers[:, 0]))
@@ -1936,7 +1927,6 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
     config_run = copy.deepcopy(config)
     out_stem = wafer_id
 
-    # Overwrite configuration using dynamic summary block parameters if parsed
     if json_file and Path(json_file).exists():
         try:
             defect_data = load_defect_json(json_file)
@@ -1963,13 +1953,14 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
     try:
         gds_xc, gds_yc, gds_R = parse_gds_wafer_boundary(
             config_run["gds_path"],
-            layer=config_run["gds_layer"],
-            datatype=config_run["gds_datatype"]
+            layer=config_run.get("gds_layer", 1),
+            datatype=config_run.get("gds_datatype", 0)
         )
         gds_R = float(gds_R)
         print(f"[{out_stem}] GDS Wafer details found: Center=({gds_xc:.1f}, {gds_yc:.1f}), R={gds_R:.1f} um")
-        gds_polygons = get_layer0_polygons(config_run["gds_path"])
-        print(f"[{out_stem}] Discovered {len(gds_polygons)} features on layer 0.")
+        
+        gds_polygons = get_gds_overlay_polygons(config_run["gds_path"], config_run)
+        print(f"[{out_stem}] Generated {len(gds_polygons)} optimized outline features for layout overlay.")
     except Exception as e:
         print(f"[{out_stem}] Critical error reading GDS data: {e}")
         return False
@@ -1988,8 +1979,6 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
 
     try:
         canvas_xc, canvas_yc, canvas_R, flat_angle = detect_wafer_on_canvas(ds_canvas, ds_factor)
-
-        # Parse Layer 4 Alignment markers from GDS file
         markers = parse_alignment_markers(config_run["gds_path"])
 
         if args.manual:
@@ -2023,7 +2012,6 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
     if exclusions_path.exists():
         exclusions = load_exclusions(exclusions_path)
 
-    # Initialize coordinate translation module
     transformer = WaferTransformer(
         canvas_center=(canvas_xc, canvas_yc),
         canvas_radius=canvas_R,
@@ -2050,7 +2038,6 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
 
     run_create = args.create or (not args.create and not args.label)
     run_label = args.label or (not args.create and not args.label)
-
     out_dir = Path(args.out_dir)
 
     # --- CELL CROP GENERATION STAGE ---
@@ -2163,13 +2150,12 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
 
             if (crop_x2 > crop_x1) and (crop_y2 > crop_y1):
                 cell_crop = rotated_local_canvas[crop_y1:crop_y2, crop_x1:crop_x2]
-                cell_crop_gds_perspective = cv2.flip(cell_crop, 1)
+                cell_crop_gds_perspective = cell_crop
 
                 cell_filename = f"{out_stem}_cell_{row}-{col}.jpg"
                 out_path = out_dir / cell_filename
                 cv2.imwrite(str(out_path), cell_crop_gds_perspective, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 
-                # Pre-render scaled workspace display copies
                 preview_w = 1200
                 preview_h = int(preview_w * cell_crop.shape[0] / cell_crop.shape[1])
                 cell_preview = cv2.resize(cell_crop_gds_perspective, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
