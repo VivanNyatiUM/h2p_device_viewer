@@ -9,15 +9,19 @@ pip install numpy opencv-python pillow gdstk
 
 ### Directory Tree
 ```text
-repository-root/
-├── tree.txt
-├── config.json                            # Active settings
-├── wafer_alignment_and_extraction.py      # Main tool
-├── semiconductor_design.gds               # Wafer layout
-├── batch_wafers.txt                       # Batch run list
-└── folder_of_tiles/                       # Raw microscope tile images
-    ├── tile_x001_y001.png
-    └── ...
+h2p_device_view/
+├── config.json                       # Main configuration file (overlaps, dimensions, GDS paths)
+├── manual_exclusions.json            # Tracking list for manually excluded camera tiles
+├── semiconductor_design.gds          # Reference GDS CAD layout design file
+├── centroid_algorithm.py             # Sub-pixel OBB snapping mathematics and feature search
+├── coordinate_transformer.py         # Handles GDS/Canvas coordinate mapping & SVD solver
+├── gds_parser.py                     # Reads GDS files, flattens layers, clusters cells
+├── wafer_metrology.py                # Wafer segmentation, circle fitting, flat angle profiling
+├── wafer_align_gui.py                # Tkinter-based manual alignment slider GUI
+├── defect_mapper_gui.py              # OpenCV-based interactive defect annotation tool
+├── large_wafer_tester.py             # OpenCV-based automated centroid snap interface
+├── wafer_alignment_and_extraction.py # Core orchestrator and main execution script
+└── subtract_defects.py               # Flat GDS boolean subtraction tool
 ```
 
 ### Batch Configuration (`batch_wafers.txt`)
@@ -31,21 +35,14 @@ Wafer_Sample_01:
 
 ### Command Line Interface (CLI)
 
-#### **Stage 1: Alignment & Native Crop Extraction**
-Run alignment metrology and extract un-rotated device crops:
+#### **Stage 1: Alignment & Native Crop Extraction Into Labeling**
 ```bash
-python wafer_alignment_and_extraction.py --batch batch_wafers.txt -c
+python wafer_alignment_and_extraction.py --batch batch_wafers.txt --manual --device -c -l
 ```
 *Optional additions:*
 *   `--manual` : Launch the interactive overlay UI to align GDS wireframes manually before cropping.
 *   `--shave 10` : Crop margin buffer size inside the rotated frame to eliminate edge artifacts.
 *   `--out-dir extracted_cells` : Customize the destination directory for crops.
-
-#### **Stage 2: Interactive Defect Labeling & Assembly**
-Annotate defects and reassemble the labeled layout:
-```bash
-python wafer_alignment_and_extraction.py --batch batch_wafers.txt -d -l
-```
 
 #### **Interactive Controls:**
 *   **`Mouse Drag`**: Draw a bounding box around a defect.
@@ -54,3 +51,12 @@ python wafer_alignment_and_extraction.py --batch batch_wafers.txt -d -l
 *   **`Left Arrow`**: Go back one cell.
 *   **`X`**: Toggle exclusion for damaged/empty devices.
 *   **`Esc` / `Q`**: Save data to `{wafer_id}_device_defects.json` and export the final annotated layout to `{wafer_id}_stitched_devices.jpg`.
+
+#### **Stage 2: Mask Generation**
+Create the Subtracted Mask File
+```bash
+python subtract_defects.py --json Wafer_A_device_defects.json --out repaired_design.gds --layers [layers]
+```
+[layers] should be represented as numbers with spaces in between. Examples:
+1
+2 4
