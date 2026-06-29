@@ -31,6 +31,13 @@ Wafer_Sample_01:
 "folder_of_tiles"
 "none"
 "none"
+Wafer_B:
+"folder_for_B"
+"none"
+"none"
+.
+.
+.
 ```
 
 ### Command Line Interface (CLI)
