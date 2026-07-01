@@ -14,6 +14,7 @@ CLASS_COLORS = {
 }
 
 KEY_MAPPING = {ord('1'): "blister", ord('2'): "tear", ord('3'): "delamination", ord('4'): "particulate", ord('5'): "hole"}
+
 LEFT_ARROW_CODES = [2424832, 65361, 81, 0x250000, 63234]
 RIGHT_ARROW_CODES = [2555904, 65363, 83, 0x270000, 63235]
 
@@ -27,7 +28,7 @@ class DeviceDefectMapperTool:
         # Store shave and pad so every crop_pixel_to_gds call uses values that
         # exactly match the Stage 1 extraction pass.
         self.shave = shave
-        self.pad   = pad
+        self.pad = pad
 
         self.output_json_path = f"{wafer_id}_device_defects.json"
         self.output_stitch_path = f"{wafer_id}_stitched_devices.jpg"
@@ -42,6 +43,7 @@ class DeviceDefectMapperTool:
             raise FileNotFoundError(f"No cell crops discovered in '{self.out_dir}'. Ensure Stage 1 extraction succeeded first.")
 
         self.cell_files.sort(key=lambda x: (x["cell_data"]["row"], x["cell_data"]["col"]))
+
         self.all_min_x = min(c["cell_data"]["bbox"][0] for c in self.cell_files)
         self.all_min_y = min(c["cell_data"]["bbox"][1] for c in self.cell_files)
         self.all_max_x = max(c["cell_data"]["bbox"][2] for c in self.cell_files)
@@ -107,14 +109,13 @@ class DeviceDefectMapperTool:
 
         self.orig_h, self.orig_w = self.img_orig.shape[:2]
         self.scale = min(self.max_disp_w / float(self.orig_w), self.max_disp_h / float(self.orig_h))
-        self.display_width  = int(self.orig_w * self.scale)
+        self.display_width = int(self.orig_w * self.scale)
         self.display_height = int(self.orig_h * self.scale)
         self.img_disp = cv2.resize(self.img_orig, (self.display_width, self.display_height))
 
         if cell_entry["filename"] not in self.annotations:
             self.annotations[cell_entry["filename"]] = []
-
-        self.save_annotations_to_file()
+            self.save_annotations_to_file()
 
         # --- Diagnostic: verify that crop_pixel_to_gds round-trips the 4 GDS corners ---
         print(f"\n[DefectMapper] Loading cell {cell_entry['cell_data']['row']}-{cell_entry['cell_data']['col']} "
@@ -137,10 +138,10 @@ class DeviceDefectMapperTool:
         legend_y = 120
         cv2.putText(self.canvas, "LEGEND GUIDE:", (self.display_width + 15, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
         for idx, (label, l_color) in enumerate([
-            ("Current Selected",   (0, 165, 255)),
+            ("Current Selected", (0, 165, 255)),
             ("Annotated / Active", (0, 120, 0)),
             ("Excluded / Damaged", (0, 0, 150)),
-            ("Unvisited / Pending",(80, 80, 80))
+            ("Unvisited / Pending", (80, 80, 80))
         ]):
             ly = legend_y + 20 + idx * 20
             cv2.rectangle(self.canvas, (self.display_width + 15, ly - 10), (self.display_width + 27, ly + 2), l_color, -1)
@@ -151,7 +152,6 @@ class DeviceDefectMapperTool:
         map_draw_size = map_size - 2 * map_padding
         map_x_start = self.display_width + 30
         map_y_start = max(250, self.display_height - map_size - 5)
-
         cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), (map_x_start + map_size - 10, map_y_start + map_size - 10), (30, 30, 30), -1)
         cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), (map_x_start + map_size - 10, map_y_start + map_size - 10), (100, 100, 100), 1)
 
@@ -162,18 +162,16 @@ class DeviceDefectMapperTool:
             norm_y1 = (min_y - self.all_min_y) / (self.gds_h + 1e-9)
             norm_x2 = (max_x - self.all_min_x) / (self.gds_w + 1e-9)
             norm_y2 = (max_y - self.all_min_y) / (self.gds_h + 1e-9)
-
             mx1 = int(map_x_start + min(norm_x1, norm_x2) * map_draw_size)
             my1 = int(map_y_start + (1.0 - max(norm_y1, norm_y2)) * map_draw_size)
             mx2 = int(map_x_start + max(norm_x1, norm_x2) * map_draw_size)
             my2 = int(map_y_start + (1.0 - min(norm_y1, norm_y2)) * map_draw_size)
-
             self.cell_map_bounds.append((mx1, my1, mx2, my2))
-            is_current  = (idx == self.current_idx)
-            is_excluded = (entry["filename"] in self.exclusions)
-            has_ann     = (len(self.annotations.get(entry["filename"], [])) > 0)
 
-            color     = (0, 165, 255) if is_current else ((0, 0, 150) if is_excluded else ((0, 120, 0) if has_ann else (80, 80, 80)))
+            is_current = (idx == self.current_idx)
+            is_excluded = (entry["filename"] in self.exclusions)
+            has_ann = (len(self.annotations.get(entry["filename"], [])) > 0)
+            color = (0, 165, 255) if is_current else ((0, 0, 150) if is_excluded else ((0, 120, 0) if has_ann else (80, 80, 80)))
             thickness = -1 if (is_current or is_excluded or has_ann) else 1
             cv2.rectangle(self.canvas, (mx1, my1), (mx2, my2), color, thickness)
             if thickness == -1:
@@ -184,7 +182,7 @@ class DeviceDefectMapperTool:
 
         for box in self.annotations.get(filename, []):
             x_tl, y_tl, w, h = box["box_px"]
-            scale_down_x = self.display_width  / float(self.native_w)
+            scale_down_x = self.display_width / float(self.native_w)
             scale_down_y = self.display_height / float(self.native_h)
             sc_x1, sc_y1 = int(x_tl * scale_down_x), int(y_tl * scale_down_y)
             sc_x2, sc_y2 = int((x_tl + w) * scale_down_x), int((y_tl + h) * scale_down_y)
@@ -235,7 +233,6 @@ class DeviceDefectMapperTool:
             cv2.rectangle(temp, (self.display_width + 5, 105), (self.display_width + 315, 335), (0, 0, 180), -1)
             cv2.rectangle(temp, (self.display_width + 5, 105), (self.display_width + 315, 335), (0, 255, 255), 2)
             cv2.putText(temp, "CHOOSE DEFECT TYPE!", (self.display_width + 15, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
-
             classes = ["blister", "tear", "delamination", "particulate", "hole"]
             for idx, c_name in enumerate(classes):
                 cy = 160 + idx * 22
@@ -259,12 +256,13 @@ class DeviceDefectMapperTool:
                 # Scale display coordinates up to native crop pixel space
                 scale_up_x = self.native_w / float(self.display_width)
                 scale_up_y = self.native_h / float(self.display_height)
+
                 orig_x1 = max(0, min(int(round(min(self.start_pt[0], self.current_pt[0]) * scale_up_x)), self.native_w))
                 orig_y1 = max(0, min(int(round(min(self.start_pt[1], self.current_pt[1]) * scale_up_y)), self.native_h))
                 orig_x2 = max(0, min(int(round(max(self.start_pt[0], self.current_pt[0]) * scale_up_x)), self.native_w))
                 orig_y2 = max(0, min(int(round(max(self.start_pt[1], self.current_pt[1]) * scale_up_y)), self.native_h))
 
-                filename  = self.cell_files[self.current_idx]["filename"]
+                filename = self.cell_files[self.current_idx]["filename"]
                 cell_data = self.cell_files[self.current_idx]["cell_data"]
 
                 # Map bounding box center — pass shave and pad explicitly to match extraction
@@ -274,23 +272,42 @@ class DeviceDefectMapperTool:
                     px_cx, px_cy, cell_data, shave=self.shave, pad=self.pad
                 )
 
-                # Map corner coordinates to derive width/height in microns
-                px_x1_gds, px_y1_gds = self.transformer.crop_pixel_to_gds(
-                    orig_x1, orig_y1, cell_data, shave=self.shave, pad=self.pad
-                )
-                px_x2_gds, px_y2_gds = self.transformer.crop_pixel_to_gds(
-                    orig_x2, orig_y2, cell_data, shave=self.shave, pad=self.pad
-                )
-                width_um  = abs(px_x2_gds - px_x1_gds)
-                height_um = abs(px_y2_gds - px_y1_gds)
+                # --- FIX: map ALL FOUR pixel-space corners to GDS, not just TL/BR ---
+                # Because the wafer (and the native crop frame) is rotated relative to
+                # the GDS axes by self.transformer.alpha, an axis-aligned pixel box maps
+                # to a ROTATED rectangle (parallelogram) in GDS microns. Reducing that to
+                # a single width/height pair and reconstructing an axis-aligned GDS box
+                # (as subtract_defects.py used to do) throws away the rotation and is the
+                # source of the mask/stitched-image misalignment. We now store the full
+                # rotated quadrilateral so the mask cut can reproduce it exactly.
+                corners_px = [
+                    (orig_x1, orig_y1),  # top-left
+                    (orig_x2, orig_y1),  # top-right
+                    (orig_x2, orig_y2),  # bottom-right
+                    (orig_x1, orig_y2),  # bottom-left
+                ]
+                corners_gds = [
+                    self.transformer.crop_pixel_to_gds(px, py, cell_data, shave=self.shave, pad=self.pad)
+                    for px, py in corners_px
+                ]
+                corners_gds = [[round(float(gx), 3), round(float(gy), 3)] for gx, gy in corners_gds]
+
+                # Axis-aligned width/height retained for display/sorting/back-compat only.
+                # These DO NOT represent a valid axis-aligned GDS box when alpha != 0 —
+                # subtract_defects.py must use corners_gds for the actual mask geometry.
+                xs = [c[0] for c in corners_gds]
+                ys = [c[1] for c in corners_gds]
+                width_um = max(xs) - min(xs)
+                height_um = max(ys) - min(ys)
 
                 self.annotations[filename].append({
                     "type": assigned_class,
                     "box_px": [orig_x1, orig_y1, orig_x2 - orig_x1, orig_y2 - orig_y1],
                     "center_x_um": round(center_x_um, 3),
                     "center_y_um": round(center_y_um, 3),
-                    "width_um":    round(width_um, 3),
-                    "height_um":   round(height_um, 3)
+                    "width_um": round(width_um, 3),
+                    "height_um": round(height_um, 3),
+                    "corners_gds": corners_gds
                 })
                 self.save_annotations_to_file()
 
@@ -300,9 +317,8 @@ class DeviceDefectMapperTool:
         print("\nCompiling GDS-aligned physical wafer overview composite...")
         out_size = self.config.get("output_image_size", 4000)
         composite_canvas = np.zeros((out_size, out_size, 3), dtype=np.uint8)
-        half  = out_size / 2.0
+        half = out_size / 2.0
         scale = (0.925 * half) / self.gds_R
-
         cv2.circle(composite_canvas, (int(half), int(half)), int(self.gds_R * scale), (60, 60, 60), 2, lineType=cv2.LINE_AA)
 
         for cell_entry in self.cell_files:
@@ -322,12 +338,10 @@ class DeviceDefectMapperTool:
             pts_img = [self.transformer.transform_gds_to_target_img(gx, gy, out_size)
                        for gx, gy in [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]]
             pts_img = np.array(pts_img)
-
             tx_min, ty_min = np.min(pts_img, axis=0)
             tx_max, ty_max = np.max(pts_img, axis=0)
             pt_x1, pt_y1 = int(round(tx_min)), int(round(ty_min))
             pt_x2, pt_y2 = int(round(tx_max)), int(round(ty_max))
-
             cell_w, cell_h = pt_x2 - pt_x1, pt_y2 - pt_y1
             if cell_w > 0 and cell_h > 0:
                 composite_canvas[pt_y1:pt_y2, pt_x1:pt_x2] = cv2.resize(
@@ -341,6 +355,7 @@ class DeviceDefectMapperTool:
         cv2.namedWindow("Device Defect Register")
         cv2.setMouseCallback("Device Defect Register", self.handle_mouse)
         self.redraw_canvas()
+
         while True:
             key = cv2.waitKeyEx(20)
             if key in RIGHT_ARROW_CODES or key == 32 or key in [ord('n'), ord('N')]:
@@ -368,4 +383,5 @@ class DeviceDefectMapperTool:
                 self.save_exclusions_file()
                 self.stitch_and_save_wafer_layout()
                 break
+
         cv2.destroyAllWindows()
